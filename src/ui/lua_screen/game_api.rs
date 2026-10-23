@@ -111,12 +111,43 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
         })
     });
 
+    // `combine_check(slot, target)`: the original's `menu_item_check_combine`.
+    // Ordinary recipes are applied immediately and return `"applied"`; a
+    // valid herb recipe is deferred for the 0xF5 yes/no prompt and returns
+    // `"herb"`; `"drug_store"`, `"herb_no_recipe"` and `"none"` are the
+    // refusals. The parser maps the enum to those strings.
+    methods.add_method_mut(
+        "combine_check",
+        |_lua, api, (slot, target): (usize, usize)| {
+            let game = api.game_mut("combine_check")?;
+            if target >= game.inventory.len() {
+                return Ok("none");
+            }
+            Ok(match game.combine_check(slot, target) {
+                crate::game::CombineCheck::Applied => "applied",
+                crate::game::CombineCheck::Herb { .. } => "herb",
+                crate::game::CombineCheck::NeedsDrugStore => "drug_store",
+                crate::game::CombineCheck::HerbNoRecipe => "herb_no_recipe",
+                crate::game::CombineCheck::NoRecipe => "none",
+            })
+        },
+    );
+
     // `show_message(id)`: open the game's message window on global message
     // `id`; refused while one is already up.
     methods.add_method_mut("show_message", |_lua, api, id: u8| {
         let game = api.game_mut("show_message")?;
         game.show_message(id, 0);
         Ok(())
+    });
+
+    // `message_choice()`: the game's `g_menu_choice_id` byte. Bit `0x80` is
+    // set while a message owns the frame; bit 0 is the yes/no answer once it
+    // has been confirmed (0 = Yes, 1 = No), exactly the byte the reference's
+    // scripts read with `cmpb 5`.
+    methods.add_method_mut("message_choice", |_lua, api, ()| {
+        let game = api.game_mut("message_choice")?;
+        Ok(i64::from(game.message.menu_choice_id()))
     });
 }
 

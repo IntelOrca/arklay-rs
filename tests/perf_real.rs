@@ -3,14 +3,16 @@
 //! Run with:
 //! `TMPDIR=$PWD/target/tmp-test ARKLAY_RE1_ROOT=/path/to/re1 \
 //!  ARKLAY_RE1_PACK=/path/to/re1.akpak \
-//!  cargo test --profile test-release --test real perf_real:: -- --ignored --nocapture`
+//!  cargo test --profile test-release --test perf_real -- --ignored --nocapture`
 //!
 //! The budgets and their measurement are recorded in `docs/performance.md`.
 //! `ARKLAY_PERF_BUDGET_MS` overrides the per-tick p95 budget so a deliberately
 //! lower value fails the test, exactly as the milestone acceptance requires.
-//! The always-run plumbing test for the report format lives in `tests/cli.rs`.
+//! The test lives in its own binary, not in `tests/real`, so the other
+//! real-asset tests cannot steal the cores its wall-clock budgets measure.
 
-use crate::common;
+#[path = "common/mod.rs"]
+mod common;
 
 use std::process::Command;
 use std::time::Instant;

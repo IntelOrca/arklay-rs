@@ -47,8 +47,10 @@ fn every_packed_weapon_asset_parses_and_resolves() {
     assert!(pack.contains("player/00.emw"), "the locomotion pair");
     assert!(pack.contains("player/01.emw"));
 
-    // Every character's held-weapon mesh resolves and parses.
-    for id in 0x20..=0x2Eu8 {
+    // Every armed character id's held-weapon mesh resolves and parses. The
+    // ids in between (0x25..=0x29) are the unarmed characters and carry no
+    // held-weapon TMD; `character_weapon_id` returns None for them.
+    for id in (0x20..=0x24).chain(0x2A..=0x2E) {
         for behavior in 1..=6u8 {
             let entry = weapons::character_weapon_entry(id, behavior).unwrap();
             let bytes = pack
@@ -58,6 +60,15 @@ fn every_packed_weapon_asset_parses_and_resolves() {
                 panic!("{entry} does not parse: {err:#}");
             });
             assert_eq!(tmd.objects.len(), 1, "{entry} is the held mesh");
+        }
+    }
+    for id in 0x25..=0x29 {
+        for behavior in 1..=6u8 {
+            assert_eq!(
+                weapons::character_weapon_entry(id, behavior),
+                None,
+                "unarmed character {id:#04x} behavior {behavior}"
+            );
         }
     }
     assert_eq!(weapons::character_weapon_entry(0x20, 0), None, "unarmed");

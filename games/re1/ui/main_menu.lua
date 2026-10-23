@@ -41,9 +41,10 @@ local SUBMENU_OPEN_FRAMES = 8
 local SUBMENU_X, SUBMENU_Y = 0x90, 0x39
 local OPTION_W, OPTION_H = 0x30, 0x18
 
--- Global messages the actions show.
+-- Global messages the actions show. 0xF5 is the original's yes/no prompt
+-- ("Do you want to mix the herbs?") and 0xF6 the no-recipe refusal.
 local MESSAGE_NEEDS_DRUG_STORE = 0xF2
-local MESSAGE_HERB_MIX = 0xF5
+local MESSAGE_MIX_PROMPT = 0xF5
 local MESSAGE_NO_RECIPE = 0xF6
 local MESSAGE_USE_REFUSED = 0xF7
 
@@ -124,6 +125,17 @@ function M.open(api, _args)
     s.view = nil
     s.view_item = 0
     s.view_slide = 0
+    -- A herb mix waiting on the reference's 0xF5 yes/no prompt: the slots to
+    -- combine once the player answers Yes.
+    s.pending_combine = nil
+    -- A refusal message that closes the submenu when it dismisses.
+    s.pending_close = false
+    -- The message task runs after the menu task in the original, so the
+    -- answer reaches the menu one tick after the window hides it.
+    s.pending_answer = false
+    -- The original retracts the MOVE cursor for four ticks before the
+    -- submenu's own eight-frame close starts.
+    s.move_close_delay = 0
     -- The cursor blink counter: bit 0x20 draws the bright cursor.
     s.blink = 0
     s.show_cursor = true
@@ -166,6 +178,48 @@ local function step_view_back()
     end
 end
 
+--- Resolve a message the MOVE confirm opened.
+---
+--- The engine runs the message window before the menu's tick, so the choice
+--- byte has already changed on the frame the player answers. 0xF5 is the
+--- reference's yes/no prompt: Yes applies the mix and closes the submenu,
+--- No returns to the move cursor. 0xF2's refusal message closes the submenu,
+--- and 0xF6's no-recipe message leaves the move cursor up; both dismiss
+--- through the game's message window.
+local function resolve_pending(api)
+    local choice = api:message_choice()
+    if choice & 0x80 ~= 0 then
+        return
+    end
+    -- The original's menu task runs before the message task, so the answer
+    -- the message task resolved this tick reaches the menu on the next one.
+    if not s.pending_answer then
+        s.pending_answer = true
+        return
+    end
+    if s.pending_close then
+        s.pending_close = false
+        s.pending_answer = false
+        s.closing = true
+        s.from_action = true
+        return
+    end
+    if s.pending_combine == nil then
+        return
+    end
+    local pending = s.pending_combine
+    s.pending_combine = nil
+    s.pending_answer = false
+    if choice & 1 == 0 then
+        api:sound("decide")
+        api:combine(pending.slot, pending.target)
+        refresh_selection(api)
+        s.move_close_delay = 4
+    else
+        api:sound("cancel")
+    end
+end
+
 --- One frame: a deferred use first (the original's input runs before the
 --- health monitor), the CHECK slide, the submenu animation, the monitor.
 function M.tick(api)
@@ -185,7 +239,16 @@ function M.tick(api)
     elseif s.view == "back" then
         step_view_back()
     end
-    if s.closing then
+    local started_close = false
+    if s.move_close_delay > 0 then
+        s.move_close_delay = s.move_close_delay - 1
+        if s.move_close_delay == 0 then
+            s.closing = true
+            s.from_action = true
+            started_close = true
+        end
+    end
+    if s.closing and not started_close then
         -- The close walks the open sequence backwards; the cursor returns
         -- to the inventory when the box is gone.
         if s.frames > 0 then
@@ -206,6 +269,7 @@ function M.tick(api)
         s.frames = s.frames + 1
     end
     Bar.update(s.bar, api)
+    resolve_pending(api)
     publish(api)
 end
 
@@ -371,14 +435,21 @@ local function move_input(api, key)
         if slot == nil or target == nil then
             return
         end
-        local result, herb = api:combine(slot, target)
+        -- The original's `menu_item_check_combine`: ordinary recipes apply
+        -- on the confirm and close the submenu; a herb mix only opens the
+        -- 0xF5 yes/no prompt, and the MOVE confirm applies it after Yes.
+        local result = api:combine_check(slot, target)
         if result == "applied" then
             refresh_selection(api)
-            s.mode = NAVIGATION
-            if herb then
-                api:show_message(MESSAGE_HERB_MIX)
-            end
+            s.move_close_delay = 4
+        elseif result == "herb" then
+            s.pending_combine = { slot = slot, target = target }
+            s.pending_answer = false
+            api:show_message(MESSAGE_MIX_PROMPT)
         elseif result == "drug_store" then
+            -- The refusal message closes the submenu when it dismisses.
+            s.pending_close = true
+            s.pending_answer = false
             api:show_message(MESSAGE_NEEDS_DRUG_STORE)
         elseif result == "herb_no_recipe" then
             -- Two herbs with no recipe; every other pair is refused

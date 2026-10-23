@@ -753,7 +753,7 @@ replaces the retired executable `text/*.bin` tables.
 | Decode budgets and memory ceilings | `src/budget.rs` (parallel budget slice), `tests/memory.rs` | present |
 | `arklay verify` | `src/verify.rs`, `tests/cli.rs` | present |
 | CLI error paths and atomic outputs | `src/atomic.rs`, `tests/cli.rs` | present |
-| `--stats` frame-time report | `src/stats.rs`, `tests/cli.rs`, `tests/real/perf_real.rs` | present |
+| `--stats` frame-time report | `src/stats.rs`, `tests/cli.rs`, `tests/perf_real.rs` | present |
 | Full-game soak | `tests/soak_real.rs` (ignored, `ARKLAY_SOAK=1`, release only) | present |
 | CI matrix (Linux/Windows/release/MSRV/artifact) | `.github/workflows/ci.yml` | present |
 | Local gate | `scripts/check.sh` | present |

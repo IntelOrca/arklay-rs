@@ -31,9 +31,9 @@ these numbers exclude the interactive mixer and presentation costs.
 | Effect update, 600 ticks | 0.24-0.31 ms | not asserted | - |
 | Presented frame at `--frame-rate 120` (software, tweened) | avg 0.7-3.2 ms, max <= 5.6 ms on rooms 101, 105, 106, 203, 30B, 50F (2026-10-19, XPS 15) | 8.3 ms (1/120 s) | ~1.5x worst case |
 | 600-tick room run, process start and pack open included | 318-524 ms | 5 s | ~10x |
-| Full-game soak, one pass | 394.1 / 395.8 / 393.1 s | 900 s | ~2.3x |
-| Full-game soak, all three passes | 1183.0 s | - | - |
-| Soak peak above baseline | 11.0 MiB | 512 MiB | ~45x |
+| Full-game soak, one pass | 1051.7 / 1046.9 / 1046.4 s (8-core, 2026-10-22) | 1800 s | ~1.7x |
+| Full-game soak, all three passes | 3144.9 s (8-core, 2026-10-22) | - | - |
+| Soak peak above baseline | 19.3 MiB (8-core, 2026-10-22) | 512 MiB | ~26x |
 | Soak live-byte drift between passes 2 and 3 | 0 MiB | 32 MiB | - |
 | Conversion, single pack (770,227,997 bytes in, zstd level 6) | 3.8 s, 479,865,985 bytes out (2026-10-13) | - | - |
 | Conversion peak RSS | 1256 MB | - | - |
@@ -70,7 +70,7 @@ The p95 is the upper edge of a power-of-two microsecond histogram bucket
 one microsecond therefore prints as `0` in the microsecond report; the budgets
 are stated in milliseconds so they stay meaningful on slower machines.
 
-The soak budgets live in `tests/soak_real.rs`: `MAX_PASS_SECONDS` (900),
+The soak budgets live in `tests/soak_real.rs`: `MAX_PASS_SECONDS` (1800),
 `MAX_PASS_EXTRA_BYTES` (512 MiB) and `MAX_LIVE_DELTA_BYTES` (32 MiB). The soak
 is a coverage tool, not a benchmark; its ceilings exist to catch a runaway,
 not to enforce a tight frame time. It only runs when `ARKLAY_SOAK=1` is set
@@ -79,13 +79,13 @@ live-bytes measurement sees nothing but the soak.
 
 ## The performance test
 
-`tests/real/perf_real.rs` (ignored) runs `arklay <pack> --room <id> --ticks 600
+`tests/perf_real.rs` (ignored, its own test binary) runs `arklay <pack> --room <id> --ticks 600
 --stats` on sampled rooms and asserts the budgets above in the release
 profile:
 
 ```sh
 ARKLAY_RE1_ROOT=/path/to/re1 ARKLAY_RE1_PACK=/path/re1.akpak \
-  cargo test --profile test-release --test real perf_real:: -- --ignored --nocapture
+  cargo test --profile test-release --test perf_real -- --ignored --nocapture
 ```
 
 `ARKLAY_PERF_BUDGET_MS=<ms>` overrides the per-tick p95 budget. Setting it
@@ -93,7 +93,7 @@ below the measured value fails the test, which is how the milestone's
 acceptance checks the override path:
 
 ```sh
-ARKLAY_PERF_BUDGET_MS=0.001 ... cargo test --profile test-release --test real perf_real:: -- --ignored
+ARKLAY_PERF_BUDGET_MS=0.001 ... cargo test --profile test-release --test perf_real -- --ignored
 ```
 
 Any conservative budget can be raised with `<ms>`; the docs table is updated

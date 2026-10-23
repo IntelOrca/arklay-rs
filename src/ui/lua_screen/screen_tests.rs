@@ -5,6 +5,7 @@ use super::*;
 
 use crate::game::InventoryItem;
 use crate::items;
+use crate::message::{MessageInput, MessagePhase};
 use crate::pack::Pack;
 use crate::save::{self, SaveFile};
 use crate::transition::FadeColor;
@@ -3788,9 +3789,42 @@ fn main_menu_two_herbs_combine_through_the_move_action() {
     menu.right();
     assert_eq!(menu.eval::<i64>("return M.state.move_cursor"), 10);
     menu.confirm();
-    assert_eq!(menu.game.message.id, Some(0xF5), "the herb-mix message");
+    assert_eq!(menu.game.message.id, Some(0xF5), "the herb-mix prompt");
+    assert_eq!(menu.game.inventory.len(), 2, "nothing is mixed before Yes");
+
+    // The engine runs the message window before the menu tick. Drive the
+    // prompt to YesNo and answer Yes, then let the menu tick apply the mix.
+    menu.game.cancel_message();
+    assert!(menu.game.message.start(0xF5, 0, &[0x08], true));
+    let room = crate::state::RoomState::default();
+    let text = crate::text::Text::default();
+    for _ in 0..4 {
+        menu.game
+            .update_message(MessageInput::default(), &room, &text);
+    }
+    assert_eq!(menu.game.message.phase(), MessagePhase::YesNo);
+    menu.game.update_message(
+        MessageInput {
+            action: true,
+            ..MessageInput::default()
+        },
+        &room,
+        &text,
+    );
+    assert!(!menu.game.message.active);
+    // The menu task sees the answer one tick after the message task; the mix
+    // then waits the four-tick MOVE-cursor retract before the box closes.
+    menu.tick();
+    assert_eq!(menu.game.inventory.len(), 2, "the answer is one tick late");
+    menu.tick();
     assert_eq!(menu.game.inventory.len(), 1);
     assert_eq!(menu.game.inventory[0].id, 0x46, "green+red mixed herb");
+    assert_eq!(menu.mode(), MODE_MOVE, "the prompt applies, then closes");
+    for _ in 0..4 {
+        menu.tick();
+    }
+    assert_eq!(menu.value("closing"), 1, "the box starts its close");
+    menu.finish_close();
     assert_eq!(menu.mode(), MODE_NAVIGATION);
 }
 

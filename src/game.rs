@@ -908,6 +908,23 @@ pub enum CombineResult {
     },
 }
 
+/// The menu MOVE check's outcome (`menu_item_check_combine`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CombineCheck {
+    /// The pair has no recipe and is not a herb pair: the confirm does nothing.
+    NoRecipe,
+    /// Two herbs with no recipe: message `0xF6`, then back to the move cursor.
+    HerbNoRecipe,
+    /// Chemicals outside the guardhouse drug store: message `0xF2`, then the
+    /// submenu closes.
+    NeedsDrugStore,
+    /// A valid herb recipe, not applied yet: the menu shows the `0xF5` yes/no
+    /// prompt and applies with [`GameState::combine_slots`] on Yes.
+    Herb { chemical: bool },
+    /// An ordinary recipe, applied immediately (the original's return 4).
+    Applied,
+}
+
 /// What a room action does when the player triggers it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoomActionKind {
@@ -5863,28 +5880,66 @@ impl GameState {
     /// [`CombineResult::NoRecipe`] otherwise, exactly like the original's two
     /// distinct refusals.
     pub fn combine_slots(&mut self, cursor_slot: usize, target_slot: usize) -> CombineResult {
+        match self.combine_recipe(cursor_slot, target_slot) {
+            Err(result) => result,
+            Ok((record, herb)) => self.apply_combine_record(cursor_slot, target_slot, record, herb),
+        }
+    }
+
+    /// Resolve the menu MOVE/combine without applying a herb mix.
+    ///
+    /// This is the original's `menu_item_check_combine`: an ordinary recipe is
+    /// applied immediately (return 4), while a herb pair is only validated so
+    /// the menu can ask the `0xF5` yes/no prompt first (return 2/3). The
+    /// caller applies a deferred herb mix with [`GameState::combine_slots`]
+    /// after Yes.
+    pub fn combine_check(&mut self, cursor_slot: usize, target_slot: usize) -> CombineCheck {
+        match self.combine_recipe(cursor_slot, target_slot) {
+            Err(CombineResult::HerbNoRecipe) => CombineCheck::HerbNoRecipe,
+            Err(CombineResult::NeedsDrugStore) => CombineCheck::NeedsDrugStore,
+            Err(_) => CombineCheck::NoRecipe,
+            Ok((record, true)) => CombineCheck::Herb {
+                chemical: record.effect == 4,
+            },
+            Ok((record, false)) => {
+                self.apply_combine_record(cursor_slot, target_slot, record, false);
+                CombineCheck::Applied
+            }
+        }
+    }
+
+    /// The recipe between the two slots, or the refusal the reference reports.
+    /// `Ok` carries the record and whether the cursor item is a herb (the
+    /// deferred prompt case); it never writes the inventory.
+    fn combine_recipe(
+        &self,
+        cursor_slot: usize,
+        target_slot: usize,
+    ) -> Result<(items::CombineRecord, bool), CombineResult> {
         if cursor_slot == target_slot {
-            return CombineResult::NoRecipe;
+            return Err(CombineResult::NoRecipe);
         }
         let Some(cursor) = self.inventory.get(cursor_slot).copied() else {
-            return CombineResult::NoRecipe;
+            return Err(CombineResult::NoRecipe);
         };
         let Some(target) = self.inventory.get(target_slot).copied() else {
-            return CombineResult::NoRecipe;
+            return Err(CombineResult::NoRecipe);
         };
         if cursor.id == 0 || target.id == 0 {
-            return CombineResult::NoRecipe;
+            return Err(CombineResult::NoRecipe);
         }
         let Some(record) = items::combine(cursor.id, target.id) else {
             // No recipe: the original distinguishes two herbs (its result 3,
             // the `0xF6` "cannot combine" message) from every other pair.
-            return if (HERB_MIN..=HERB_MAX).contains(&cursor.id)
-                && (HERB_MIN..=HERB_MAX).contains(&target.id)
-            {
-                CombineResult::HerbNoRecipe
-            } else {
-                CombineResult::NoRecipe
-            };
+            return Err(
+                if (HERB_MIN..=HERB_MAX).contains(&cursor.id)
+                    && (HERB_MIN..=HERB_MAX).contains(&target.id)
+                {
+                    CombineResult::HerbNoRecipe
+                } else {
+                    CombineResult::NoRecipe
+                },
+            );
         };
         // The one-way ammo transfers need an empty destination: effect 6 fills
         // the cursor stack, effect 7 the target stack, and the original refuses
@@ -5892,12 +5947,23 @@ impl GameState {
         if (record.effect == 6 && cursor.quantity != 0)
             || (record.effect == 7 && target.quantity != 0)
         {
-            return CombineResult::NoRecipe;
+            return Err(CombineResult::NoRecipe);
         }
         if (CHEMICAL_MIN..=CHEMICAL_MAX).contains(&cursor.id) && !self.is_drug_store() {
-            return CombineResult::NeedsDrugStore;
+            return Err(CombineResult::NeedsDrugStore);
         }
         let herb = (HERB_MIN..=HERB_MAX).contains(&cursor.id);
+        Ok((record, herb))
+    }
+
+    /// Write a resolved recipe into the slots and run its effect.
+    fn apply_combine_record(
+        &mut self,
+        cursor_slot: usize,
+        target_slot: usize,
+        record: items::CombineRecord,
+        herb: bool,
+    ) -> CombineResult {
         self.inventory[cursor_slot].id = record.new_cursor;
         self.inventory[target_slot].id = record.new_target;
         if record.new_target == 0 {
@@ -9543,6 +9609,33 @@ mod tests {
         state.add_item(0x45, 1); // blue herb
         assert_eq!(state.combine_slots(0, 1), CombineResult::HerbNoRecipe);
         assert_eq!(state.inventory.len(), 2);
+    }
+
+    #[test]
+    fn combine_check_defers_herbs_and_applies_other_recipes() {
+        // The menu MOVE confirm checks first: a herb mix is only validated so
+        // the 0xF5 prompt can ask, while an ordinary recipe applies at once.
+        let mut state = game();
+        state.add_item(0x44, 1); // green herb
+        state.add_item(0x43, 1); // red herb
+        assert_eq!(
+            state.combine_check(0, 1),
+            CombineCheck::Herb { chemical: false }
+        );
+        assert_eq!(state.inventory.len(), 2, "the herb mix waits for Yes");
+        assert_eq!(state.inventory[0].id, 0x44);
+        assert_eq!(state.inventory[1].id, 0x43);
+        assert!(matches!(
+            state.combine_slots(0, 1),
+            CombineResult::Applied { herb: true, .. }
+        ));
+
+        let mut state = game();
+        state.add_item(0x02, 1); // Beretta
+        state.add_item(0x0B, 30); // handgun ammo
+        assert_eq!(state.combine_check(0, 1), CombineCheck::Applied);
+        assert_eq!(state.inventory[0].quantity, 15, "the ammo applied now");
+        assert_eq!(state.inventory[1].quantity, 16);
     }
 
     fn insn(offset: usize, op: &'static Op, decoded: Decoded, len: usize, values: &[i64]) -> Insn {

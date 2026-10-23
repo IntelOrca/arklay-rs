@@ -2068,7 +2068,9 @@ pub fn draw_door_scene(
 ///
 /// `fade_type` 1 is a white flash and 2 (or anything else) is black. The
 /// overlay alpha is `state >> 7` clamped to 0..=255, matching the original's
-/// fading-rect brightness.
+/// fading-rect brightness. The GPU blends with `round(src * (255 - alpha) +
+/// target * alpha) / 255`; truncating here leaves the door and room-entry
+/// fades one LSB dark over most of a fading frame.
 pub fn draw_fade_overlay(framebuffer: &mut Framebuffer, fade: &crate::door::vm::Fade) {
     let alpha = (fade.state >> 7).clamp(0, 255) as u32;
     if alpha == 0 {
@@ -2081,8 +2083,8 @@ pub fn draw_fade_overlay(framebuffer: &mut Framebuffer, fade: &crate::door::vm::
     };
     for pixel in framebuffer.rgba.as_chunks_mut::<4>().0 {
         for (channel, &target) in pixel.iter_mut().zip(&colour) {
-            *channel =
-                ((u32::from(*channel) * (255 - alpha) + u32::from(target) * alpha) / 255) as u8;
+            *channel = ((u32::from(*channel) * (255 - alpha) + u32::from(target) * alpha + 127)
+                / 255) as u8;
         }
     }
 }

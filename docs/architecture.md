@@ -483,7 +483,8 @@ These hold across every milestone and are the regression gate:
   live bytes, so it must run alone; without `ARKLAY_SOAK=1` it skips with a
   printed note. No routine pass runs it.
 - Performance budgets (release): `cargo test --profile test-release --test
-  real perf_real:: -- --ignored --nocapture`; `ARKLAY_PERF_BUDGET_MS=<ms>`
+  perf_real -- --ignored --nocapture`; the test has its own binary so the
+  other real-asset tests cannot take its cores. `ARKLAY_PERF_BUDGET_MS=<ms>`
   overrides the per-tick p95 budget.
 - Fuzzing (nightly, separate package):
   `cd fuzz && cargo +nightly fuzz run <target> -- -max_total_time=300`.

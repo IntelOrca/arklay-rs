@@ -1402,10 +1402,11 @@ fn room_20a0_water_tank_blend_weight_rebaselines_its_capture() {
         }
     }
     println!("ROOM20A0 cut {best_cut}: the tank blend weight changes {best} pixels");
-    // Re-baselined: cut 1's tank surface is the only capture the override
-    // moves, and the 0.5 half blend -> 0.2 override mix repaints 837 pixels.
+    // Re-baselined after #69's llvmpipe-exact rasteriser and entity-position
+    // lighting: cut 1's tank surface is the only capture the override moves,
+    // and the 0.5 half blend -> 0.2 override mix now repaints 877 pixels.
     assert_eq!(
-        best, 837,
+        best, 877,
         "cut {best_cut}: the water-tank blend weight changed {best} pixels"
     );
     assert_eq!(best_cut, 1, "the tank capture moved off cut 1");

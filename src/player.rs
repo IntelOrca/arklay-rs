@@ -618,6 +618,11 @@ pub struct PlayerState {
     /// stop. The first stop tick switches the animation to the body idle clip
     /// with a fresh blend and sheds `RUN_STOP_DECEL` from the run speed.
     pub run_stop_ticks: u8,
+    /// The walk clip frame a released run handed back to on its run tick.
+    /// The walk handler applies it on the next tick, so the release tick still
+    /// draws the run pose (the original's `menu` 0x004962fa write lands after
+    /// that tick's `Joint_move`).
+    pub walk_reentry: Option<usize>,
     /// The next tick selects its behavior through the normal entry path even
     /// when the requested behavior matches the current one; a finished run
     /// stop sets it so idle re-arms a fresh blend.
@@ -703,6 +708,7 @@ pub fn spawn(id: RoomId, room: &RoomState) -> PlayerState {
         detached_clip: crate::weapons::DetachedClip::default(),
         slow_counter: 0,
         run_stop_ticks: 0,
+        walk_reentry: None,
         fresh_entry: false,
         shadow_half_x: crate::shadow::PLAYER_HALF_X,
         shadow_half_z: crate::shadow::PLAYER_HALF_Z,
@@ -787,6 +793,25 @@ pub fn update_with_options(
     if player.fresh_entry {
         player.fresh_entry = false;
         player.behavior = BEHAVIOR_ENTRY;
+    }
+
+    // The walk frame the released run handed back to. The release tick drew
+    // the run pose (its `Joint_move` ran before the hand-off write); this tick
+    // enters the walk clip on that frame and lets the normal walk advance
+    // blend from the run pose.
+    if let Some(frame) = player.walk_reentry.take() {
+        player.clip_source = ClipSource::Emw;
+        player.anim.set_clip(WALK_CLIP);
+        player.anim.frame = frame;
+    }
+
+    // Run release with forward still held: the run handler hands back to the
+    // walk under frame 0 on this tick (0x004962fa), after its `Joint_move` and
+    // movement have run on the run clip. The walk frame it writes draws on the
+    // next tick.
+    if matches!(player.behavior, BEHAVIOR_RUN | BEHAVIOR_RUN_ENTRY) && input.up && !input.run {
+        release_run_to_walk(player, room, emd_clips, emw_clips, room_clips, input);
+        return;
     }
 
     // Classic REbirth's quick turn: while a backward movement state owns the
@@ -1061,6 +1086,52 @@ pub fn update_with_options(
     }
 }
 
+/// The run handler's release branch (`0x004962fa`): forward is still held
+/// but the run modifier is gone, so the handler finishes its run tick
+/// (`Joint_move` and `Add_speedXZ`) and writes the walk hand-back at the tail.
+/// The walk handler's next tick applies that frame with a fresh three-step
+/// blend.
+fn release_run_to_walk(
+    player: &mut PlayerState,
+    room: &RoomState,
+    emd_clips: &[Clip],
+    emw_clips: &[Clip],
+    room_clips: &[Clip],
+    input: Input,
+) {
+    // A run entry still dispatching through the handover ticks the run clip
+    // first: case 0 selects it and falls into case 1.
+    if player.behavior == BEHAVIOR_RUN_ENTRY {
+        let stride = player.entry_stride(BEHAVIOR_RUN, emw_clips);
+        player.set_clip(ClipSource::Emw, RUN_CLIP);
+        if let Some(frame) = stride {
+            player.anim.frame = frame;
+        } else {
+            player.anim.frame = RUN_ENTRY_FRAME;
+        }
+    }
+    // Case 1 before the hand-back: the run steering, speed and footstep, then
+    // `Joint_move` advances the run pose that this tick draws.
+    player.angle = turned_angle(player.angle, BEHAVIOR_RUN, input);
+    player.move_speed_current = RUN_SPEED as u16;
+    player.emit_footsteps(BEHAVIOR_RUN, emd_clips, emw_clips, room_clips);
+    player.locomotion_tick(room, BEHAVIOR_RUN, RUN_SPEED);
+    player.advance(emd_clips, emw_clips, room_clips);
+    // `frameBefore` is the frame counter after the run's `Joint_move`, i.e.
+    // the port's next `anim.frame`; the run's stride-continuing walk frame
+    // follows the same 10/0x19 split as `entry_stride`.
+    let next = player.anim.frame;
+    let frame = if next != 0 && next < 0x0C {
+        WALK_REENTRY_FRAME_LATE
+    } else {
+        WALK_REENTRY_FRAME
+    };
+    player.behavior = BEHAVIOR_WALK;
+    player.walk_reentry = Some(frame);
+    player.trace_state = Some((1, 1, Some(0)));
+    player.last_behavior_id = 1;
+}
+
 /// One tick of the run's stop segment.
 ///
 /// The original's run handler switches to the body idle clip on the first
@@ -1166,6 +1237,7 @@ impl PlayerState {
     /// action state 0.
     fn enter_behavior(&mut self, behavior: u8) {
         self.behavior = behavior;
+        self.walk_reentry = None;
         self.idle_ticks = 0;
         self.idle_phase = 0;
         self.slow_counter = 0;
@@ -3200,6 +3272,7 @@ mod tests {
             detached_clip: crate::weapons::DetachedClip::default(),
             slow_counter: 0,
             run_stop_ticks: 0,
+            walk_reentry: None,
             fresh_entry: false,
             shadow_half_x: crate::shadow::PLAYER_HALF_X,
             shadow_half_z: crate::shadow::PLAYER_HALF_Z,
@@ -3441,9 +3514,14 @@ mod tests {
         blend_step(&mut player, &room, &emd, &emw, run);
         blend_step(&mut player, &room, &emd, &emw, run);
         assert_eq!(player.anim.frame, 2);
-        let run_pose = shown_pose(&player, &emd, &emw, &keyframes);
         blend_step(&mut player, &room, &emd, &emw, walk);
         assert_eq!(player.behavior, BEHAVIOR_WALK);
+        assert_eq!(player.walk_reentry, Some(WALK_REENTRY_FRAME_LATE));
+        // The release tick still draws the advanced run pose; the next tick
+        // applies the hand-back frame with a fresh three-step blend.
+        let run_pose = shown_pose(&player, &emd, &emw, &keyframes);
+        blend_step(&mut player, &room, &emd, &emw, walk);
+        assert_eq!(player.walk_reentry, None);
         assert_eq!(player.anim.display_frame, WALK_REENTRY_FRAME_LATE);
         assert_eq!(player.anim.blend_used, 3);
         assert_eq!(
@@ -3459,6 +3537,8 @@ mod tests {
             blend_step(&mut player, &room, &emd, &emw, run);
         }
         assert_eq!(player.anim.frame, 11);
+        blend_step(&mut player, &room, &emd, &emw, walk);
+        assert_eq!(player.walk_reentry, Some(WALK_REENTRY_FRAME));
         blend_step(&mut player, &room, &emd, &emw, walk);
         assert_eq!(player.anim.display_frame, WALK_REENTRY_FRAME);
         assert_eq!(player.anim.blend_used, 3);
