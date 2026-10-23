@@ -115,6 +115,14 @@ Save mode (each header names its save):
   path's `set_fading(2, 0x600)`, the animation's fade-in with the gameplay
   task suspended, the placement and `init_room`'s one-frame yield, the door
   scene, the teardown and the room-entry fade, then 207's gameplay.
+- `door_207_hold.txt` — `door_chris_10B.dat`: the same door with the confirm
+  press that opens it held through the whole transition. The skip gate reads
+  the edge-detected pad word, so the held button must not skip the animation
+  (issue #107).
+- `door_207_skip.txt` — `door_chris_10B.dat`: the counterpart to the hold
+  scenario: the confirm press opens the door on tick 10, is released, and is
+  pressed again on tick 32 past frame 10, which skips the rest of the
+  animation.
 - `door_101.txt` — `door_chris_103.dat`: the same for a same-stage door (103 to
   101), whose `room_set` runs on the placement's frame. The destination's track
   changes, so `update_room_bgm`'s `bgm_fade_out_all` holds the black tail for

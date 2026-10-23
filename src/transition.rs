@@ -10,8 +10,10 @@
 //!   black frame, without the hold;
 //! * the animation's fade ops set a counter/state pair that the transition
 //!   accumulates once per tick into the full-screen overlay;
-//! * the confirm (Cross) or run/cancel (Circle) button held after frame 10
-//!   skips the rest of the animation immediately;
+//! * a fresh confirm (Cross) or run/cancel (Circle) press after frame 10
+//!   skips the rest of the animation immediately; a button already held when
+//!   the transition begins does not, because the original's skip gate reads
+//!   its edge-detected pad word and so requires a release first;
 //! * gameplay input stays locked until the animation finishes.
 //!
 //! [`DoorStepper`] is the seam between this timeline and the `.dor`
@@ -56,6 +58,9 @@
 //!
 //! * The skip gate is `frame > 10` on the animation frame counter, which is
 //!   frozen during the phase-2 hold, exactly like the original's frame count.
+//!   The gate also reads only a fresh press: the original's `g_PlayerPadHeld`
+//!   is the edge-detected pad word, so the button that activated the door
+//!   cannot skip the animation while it stays down.
 //! * The fade accumulator is a 16-bit signed counter: it only advances while
 //!   non-negative and wraps when it overflows. The overlay is drawn before the
 //!   tick's accumulation (the original queues the rect in the same frame the
@@ -68,7 +73,7 @@
 pub const BLACK_FRAMES: u32 = 3;
 /// Extra frames phase 2 is held before its phase counter advances.
 pub const PHASE2_HOLD_FRAMES: u8 = 5;
-/// First animation frame on which held input may skip the transition.
+/// First animation frame on which a skip press may end the transition.
 pub const SKIP_AFTER_FRAME: u32 = 10;
 
 /// Overlay colour selected by the animation's fade type id.
@@ -276,7 +281,7 @@ pub struct DoorFrame {
 pub trait DoorStepper {
     /// Advance one 30 Hz frame and return its snapshot.
     fn step(&mut self) -> DoorFrame;
-    /// End the animation immediately (the held-input skip).
+    /// End the animation immediately (the skip press).
     fn finish(&mut self);
     /// Mark the sound system busy, pausing the script's `SFX` op.
     fn set_sound_busy(&mut self, busy: bool);
@@ -427,6 +432,11 @@ pub struct Transition<S> {
     drawn: (u32, i16, u8),
     last_black: bool,
     sound_busy: bool,
+    /// The skip button has been released at least once since the transition
+    /// began. The original's skip gate reads its edge-detected pad word, so a
+    /// button already down when the transition starts cannot skip until it
+    /// comes up again.
+    skip_released: bool,
 }
 
 impl<S: DoorStepper> Transition<S> {
@@ -452,6 +462,7 @@ impl<S: DoorStepper> Transition<S> {
             drawn: (0, 0, 0),
             last_black: true,
             sound_busy: false,
+            skip_released: false,
         }
     }
 
@@ -473,11 +484,30 @@ impl<S: DoorStepper> Transition<S> {
 
     /// Advance one `main_loop` frame.
     ///
-    /// `skip_held` is the engine's confirm/cancel pad state; the animation
-    /// only acts on it once it is past [`SKIP_AFTER_FRAME`]. The returned
+    /// `skip_pressed` is the engine's confirm/cancel press edge; the animation
+    /// only acts on it once it is past [`SKIP_AFTER_FRAME`] and the button has
+    /// been released at least once since the transition began. The original's
+    /// skip gate reads its edge-detected pad word, so the press that activated
+    /// the door cannot skip the animation while it stays down. The returned
     /// frame is the one to render this tick; when `finished` is set, render
     /// it once and then tear down.
-    pub fn tick(&mut self, skip_held: bool) -> TransitionFrame {
+    pub fn tick(&mut self, skip_pressed: bool) -> TransitionFrame {
+        self.skip_released |= !skip_pressed;
+        self.tick_frame(skip_pressed && self.skip_released)
+    }
+
+    /// Advance one frame with the skip gate forced.
+    ///
+    /// The engine's cutscene fast-forward skips a door the scene walks through
+    /// under the letterbox. That is not a player press, so it does not wait
+    /// for a release, and it must not arm the gate for a later normal tick;
+    /// everything else matches [`Transition::tick`].
+    pub fn tick_forced(&mut self) -> TransitionFrame {
+        self.tick_frame(true)
+    }
+
+    /// One `main_loop` frame with the skip gate already resolved.
+    fn tick_frame(&mut self, skip: bool) -> TransitionFrame {
         let mut out = FrameOut::default();
         if self.main == MainTask::Done {
             return self.output();
@@ -492,24 +522,24 @@ impl<S: DoorStepper> Transition<S> {
                 self.main_suspended = true;
             }
             out.overlay = self.fade.overlay();
-            self.pass(skip_held, &mut out);
+            self.pass(skip, &mut out);
             self.fade_step();
             if self.fade.state() < 0 {
                 self.fade.set(self.fade.fade_type(), 0, 0);
                 self.fade_active = false;
                 self.main_suspended = false;
-                self.idle_branch(skip_held, &mut out);
+                self.idle_branch(skip, &mut out);
             }
         } else {
-            self.idle_branch(skip_held, &mut out);
+            self.idle_branch(skip, &mut out);
         }
         self.output_into(out)
     }
 
     /// `main_loop`'s non-fade branch: a scheduler pass, then the accumulator
     /// draws and steps while it is non-negative.
-    fn idle_branch(&mut self, skip_held: bool, out: &mut FrameOut) {
-        self.pass(skip_held, out);
+    fn idle_branch(&mut self, skip: bool, out: &mut FrameOut) {
+        self.pass(skip, out);
         if self.fade.is_active() {
             if out.overlay.is_none() {
                 out.overlay = self.fade.overlay();
@@ -529,11 +559,11 @@ impl<S: DoorStepper> Transition<S> {
     /// One `TaskScheduler_Update`: the gameplay task, then the animation
     /// task. Every sleep is one pass long, so a task that yielded in the
     /// previous pass runs again (even within the same frame).
-    fn pass(&mut self, skip_held: bool, out: &mut FrameOut) {
+    fn pass(&mut self, skip: bool, out: &mut FrameOut) {
         if !self.main_suspended {
             self.run_main(out);
         }
-        self.run_anim(skip_held, out);
+        self.run_anim(skip, out);
     }
 
     fn run_main(&mut self, out: &mut FrameOut) {
@@ -577,14 +607,14 @@ impl<S: DoorStepper> Transition<S> {
         }
     }
 
-    fn run_anim(&mut self, skip_held: bool, out: &mut FrameOut) {
+    fn run_anim(&mut self, skip: bool, out: &mut FrameOut) {
         match self.anim {
             AnimTask::Idle | AnimTask::Exited => {}
             AnimTask::Start => {
                 self.anim_running = true;
                 self.anim = AnimTask::Run;
             }
-            AnimTask::Run => self.anim_pass(skip_held, out),
+            AnimTask::Run => self.anim_pass(skip, out),
             AnimTask::Teardown => {
                 self.fade
                     .set(self.fade.fade_type(), self.fade.counter(), -1);
@@ -595,7 +625,7 @@ impl<S: DoorStepper> Transition<S> {
     }
 
     /// One `DoorAnimLoop` pass.
-    fn anim_pass(&mut self, skip_held: bool, out: &mut FrameOut) {
+    fn anim_pass(&mut self, skip: bool, out: &mut FrameOut) {
         let raw = self.stepper.step();
         self.last = raw;
         self.sound_busy = raw.sound_busy;
@@ -611,10 +641,9 @@ impl<S: DoorStepper> Transition<S> {
 
         // The pass that reaches `END` is the last one the original runs: it is
         // drawn, then the loop exits, skipping the phase-2 hold and the
-        // frame-counter increment. A held-input skip ends the loop the same
-        // way.
+        // frame-counter increment. A skip press ends the loop the same way.
         let mut ended = raw.done;
-        if !ended && skip_held && frame > SKIP_AFTER_FRAME {
+        if !ended && skip && frame > SKIP_AFTER_FRAME {
             self.stepper.finish();
             ended = true;
         }
@@ -951,7 +980,7 @@ mod tests {
     }
 
     #[test]
-    fn held_input_skips_only_after_frame_ten() {
+    fn a_skip_press_ends_the_animation_only_after_frame_ten() {
         let mut transition = transition();
         lead_in(&mut transition);
 
@@ -974,6 +1003,49 @@ mod tests {
         assert!(transition.input_locked());
         assert!(transition.tick(true).finished);
         assert!(!transition.input_locked());
+    }
+
+    /// The action button that activated the door is still down when the
+    /// transition starts; it must not be read as a skip (issue #107).
+    #[test]
+    fn a_button_held_from_the_door_press_never_skips() {
+        let mut transition = transition();
+        for _ in 0..SKIP_AFTER_FRAME as usize + 8 {
+            let frame = transition.tick(true);
+            assert!(!frame.finished);
+        }
+        assert_eq!(
+            transition.stepper().finish_calls,
+            0,
+            "a held button must be released before it can skip"
+        );
+        assert!(transition.input_locked());
+    }
+
+    /// Once the held button is released and pressed again, the fresh press
+    /// skips exactly like the original's edge-detected pad word.
+    #[test]
+    fn a_release_then_press_skips_the_transition() {
+        let mut transition = transition();
+        for _ in 0..SKIP_AFTER_FRAME as usize + 8 {
+            transition.tick(true);
+        }
+        assert_eq!(transition.stepper().finish_calls, 0);
+        transition.tick(false);
+        let frame = transition.tick(true);
+        assert!(frame.frame > SKIP_AFTER_FRAME);
+        assert_eq!(transition.stepper().finish_calls, 1);
+    }
+
+    /// The cutscene fast-forward skips a door the scene walks through, and is
+    /// not a player press, so it does not wait for a release.
+    #[test]
+    fn the_cutscene_fast_forward_skips_a_held_button() {
+        let mut transition = transition();
+        for _ in 0..SKIP_AFTER_FRAME as usize + 8 {
+            transition.tick_forced();
+        }
+        assert_eq!(transition.stepper().finish_calls, 1);
     }
 
     #[test]
