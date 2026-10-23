@@ -121,10 +121,10 @@ reasons:
   draws in that case. The head one-shot still applies.
 - **The countdown death branch.** The machine wires the
   `MSF2_ATTRACT_DEMO`/`MSF2_DEATH_VARIANT` skips and the room dispatch
-  exactly. The attract branch is live: a reel that ends raises
-  `MSF2_ATTRACT_DEMO` and the screen takes the attract fade. The self-destruct
-  countdown timer is still absent, so the `MSF2_DEATH_VARIANT` branch is
-  never taken.
+  exactly. The attract branch is live: a demo reel boots with
+  `MSF2_ATTRACT_DEMO` set, and its end raises the dead flag so the screen
+  takes the attract fade. The self-destruct countdown timer is still absent,
+  so the `MSF2_DEATH_VARIANT` branch is never taken.
 - **The sound fade.** `BuildSndFadeTbl`'s volume ramp is not modelled: the
   screen stops the room BGM through the mixer when it opens instead of fading
   it out over the delay. Gameplay audio ends abruptly rather than ramping.
