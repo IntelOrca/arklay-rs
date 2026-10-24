@@ -1174,6 +1174,21 @@ impl Display {
         self.save_window();
     }
 
+    /// Apply the launcher's window options (aspect, size or fullscreen) to
+    /// the live window and return the options actually in force. The game
+    /// hand-off reads them back from [`Display::graphics`].
+    pub(crate) fn apply_window_options(&mut self, mut graphics: Graphics) -> Graphics {
+        let Some(current) = self.graphics.as_mut() else {
+            return graphics;
+        };
+        video::set_aspect(graphics.aspect);
+        let window = self.window;
+        let display = unsafe { SDL_GetDisplayForWindow(window) };
+        place_window(window, &mut graphics, display);
+        *current = graphics;
+        graphics
+    }
+
     /// Record the display the window is now on, so the next run opens there.
     fn display_changed(&mut self) {
         let display = unsafe { SDL_GetDisplayForWindow(self.window) };

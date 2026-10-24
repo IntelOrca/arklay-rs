@@ -254,11 +254,19 @@ enum Screen {
     Install,
     Update,
     Mods,
+    Options,
     Progress,
     Message,
 }
 
-const MAIN_ITEMS: [&str; 5] = ["PLAY GAME", "INSTALL / REBUILD", "UPDATE", "MODS", "EXIT"];
+const MAIN_ITEMS: [&str; 6] = [
+    "PLAY GAME",
+    "INSTALL / REBUILD",
+    "UPDATE",
+    "MODS",
+    "OPTIONS",
+    "EXIT",
+];
 
 const UPDATE_ITEMS: [&str; 6] = [
     "CHECK FOR UPDATES",
@@ -268,6 +276,41 @@ const UPDATE_ITEMS: [&str; 6] = [
     "CHANNEL",
     "AUTO-CHECK",
 ];
+
+/// The launcher's `OPTIONS` rows, in display order.
+const OPTIONS_ITEMS: [&str; 10] = [
+    "RENDERER",
+    "WIDESCREEN",
+    "RESOLUTION",
+    "FULLSCREEN",
+    "LANGUAGE",
+    "RENDER SCALE",
+    "MSAA",
+    "FRAME RATE",
+    "QUICK TURN",
+    "TACTICAL RELOAD",
+];
+
+/// Window sizes at the 4:3 aspect, from 3x to 8x the 320x240 frame.
+const RESOLUTIONS_STANDARD: [(u32, u32); 5] = [
+    (960, 720),
+    (1280, 960),
+    (1600, 1200),
+    (1920, 1440),
+    (2560, 1920),
+];
+
+/// Window sizes at the 16:9 aspect, from 3x to 8x the 320x180 band.
+const RESOLUTIONS_WIDE: [(u32, u32); 5] = [
+    (960, 540),
+    (1280, 720),
+    (1600, 900),
+    (1920, 1080),
+    (2560, 1440),
+];
+
+/// Render-scale steps offered by the launcher (`25..=400` is the valid range).
+const RENDER_SCALES: [u32; 7] = [50, 75, 100, 150, 200, 300, 400];
 
 /// One installed pack found under a data root.
 #[derive(Clone)]
@@ -398,6 +441,7 @@ struct Launcher {
     play_index: usize,
     update_index: usize,
     mods_index: usize,
+    options_index: usize,
     config: Config,
     packs: Vec<PackRow>,
     mods: Vec<ModRow>,
@@ -454,6 +498,7 @@ impl Launcher {
             play_index: 0,
             update_index: 0,
             mods_index: 0,
+            options_index: 0,
             config: config.clone(),
             packs,
             mods,
@@ -498,6 +543,7 @@ impl Launcher {
             Screen::Install => self.draw_install(),
             Screen::Update => self.draw_update(),
             Screen::Mods => self.draw_mods(),
+            Screen::Options => self.draw_options(),
             Screen::Progress => self.draw_progress(),
             Screen::Message => self.draw_message(),
         }
@@ -524,6 +570,7 @@ impl Launcher {
             }
             Screen::Update => "ENTER SELECT   LEFT/RIGHT CHANGE   ESC BACK",
             Screen::Mods => "SPACE TOGGLE   CTRL+UP/DOWN MOVE   O FOLDER   ESC BACK",
+            Screen::Options => "LEFT/RIGHT CHANGE   ENTER NEXT   ESC BACK",
             Screen::Progress => {
                 if self.confirm_cancel {
                     "ENTER CANCEL INSTALL   ESC KEEP GOING"
@@ -583,6 +630,18 @@ impl Launcher {
                         "{} MOD{}",
                         self.mods.len(),
                         if self.mods.len() == 1 { "" } else { "S" }
+                    ),
+                    Color::DIM,
+                ),
+                4 => (
+                    format!(
+                        "{} {}x{}",
+                        match self.config.graphics.renderer {
+                            RendererKind::Gpu => "GPU",
+                            RendererKind::Software => "SOFTWARE",
+                        },
+                        self.config.graphics.window_width,
+                        self.config.graphics.window_height
                     ),
                     Color::DIM,
                 ),
@@ -836,6 +895,36 @@ impl Launcher {
         }
     }
 
+    fn draw_options(&mut self) {
+        self.grid
+            .draw(&mut self.frame, 3, 4, "OPTIONS", Color::BODY);
+        self.table_header(5, &[(4, "SETTING"), (38, "VALUE")]);
+        for (index, label) in OPTIONS_ITEMS.iter().enumerate() {
+            let row = 7 + index;
+            let value = self.option_value(index);
+            self.table_row(
+                row,
+                index == self.options_index,
+                &[(4, label), (38, &value)],
+            );
+            self.hits.push((row, index));
+        }
+        let help = match self.options_index {
+            0 => "GPU draws HD replacements; software keeps the original 320x240 art.",
+            1 => "16:9 crops the frame; off keeps the original 4:3 view.",
+            2 => "Windowed client size. Fullscreen uses the display's desktop size.",
+            3 => "Borderless fullscreen. Alt+Enter also toggles it while playing.",
+            4 => "Game text language. System follows the OS locale.",
+            5 => "GPU only: scene resolution as a percentage of the viewport.",
+            6 => "GPU only: anti-aliasing samples. Higher is smoother and slower.",
+            7 => "Presented frames per second. The game logic still ticks at 30 Hz.",
+            8 => "Classic REbirth quick turn: BACKWARD + RUN turns 180 degrees.",
+            _ => "Classic REbirth tactical reload: AIM + RUN reloads a partial clip.",
+        };
+        self.grid
+            .draw(&mut self.frame, 19, 4, &truncate(help, 72), Color::DIM);
+    }
+
     fn draw_progress(&mut self) {
         let state = if let Some(job) = &self.job {
             job.state
@@ -1054,11 +1143,15 @@ impl Launcher {
             SDL_SCANCODE_LEFT | SDL_SCANCODE_A => {
                 if self.screen == Screen::Update {
                     self.toggle_update();
+                } else if self.screen == Screen::Options {
+                    self.change_option(-1, display);
                 }
             }
             SDL_SCANCODE_RIGHT | SDL_SCANCODE_D => {
                 if self.screen == Screen::Update {
                     self.toggle_update();
+                } else if self.screen == Screen::Options {
+                    self.change_option(1, display);
                 }
             }
             SDL_SCANCODE_EQUALS => {
@@ -1095,6 +1188,7 @@ impl Launcher {
             Screen::Play => step(&mut self.play_index, self.packs.len(), delta),
             Screen::Update => step(&mut self.update_index, UPDATE_ITEMS.len(), delta),
             Screen::Mods => step(&mut self.mods_index, self.mods.len(), delta),
+            Screen::Options => step(&mut self.options_index, OPTIONS_ITEMS.len(), delta),
             Screen::Install | Screen::Progress | Screen::Message => {}
         }
     }
@@ -1102,18 +1196,19 @@ impl Launcher {
     /// Enter/Space on the current screen. Returns true to close the launcher.
     fn activate(&mut self, display: &mut Display) -> bool {
         match self.screen {
-            Screen::Main => return self.activate_main(),
+            Screen::Main => return self.activate_main(display),
             Screen::Play => return self.play(display),
             Screen::Install => self.install(),
             Screen::Update => self.activate_update(),
             Screen::Mods => self.toggle_mod(),
+            Screen::Options => self.change_option(1, display),
             Screen::Progress => {}
             Screen::Message => self.dismiss_message(),
         }
         false
     }
 
-    fn activate_main(&mut self) -> bool {
+    fn activate_main(&mut self, display: &mut Display) -> bool {
         match self.main_index {
             0 => {
                 self.screen = Screen::Play;
@@ -1129,7 +1224,13 @@ impl Launcher {
                 self.screen = Screen::Mods;
                 self.mods_index = 0;
             }
-            4 => return true,
+            4 => {
+                display.note_window_size();
+                self.sync_window(display);
+                self.screen = Screen::Options;
+                self.options_index = 0;
+            }
+            5 => return true,
             _ => {}
         }
         false
@@ -1144,6 +1245,52 @@ impl Launcher {
             4 => self.toggle_channel(),
             5 => self.toggle_auto_check(),
             _ => {}
+        }
+    }
+
+    /// The text shown in the `VALUE` column for an `OPTIONS` row.
+    fn option_value(&self, index: usize) -> String {
+        option_value(&self.config, index)
+    }
+
+    /// Change the selected `OPTIONS` row, applying window changes immediately
+    /// and persisting every choice.
+    fn change_option(&mut self, delta: isize, display: &mut Display) {
+        if change_option(&mut self.config, self.options_index, delta) {
+            self.apply_window(display);
+        }
+        self.save_options();
+    }
+
+    /// Copy the window values the display currently has into the config, so
+    /// an entry made after a manual resize starts from the real size.
+    fn sync_window(&mut self, display: &Display) {
+        if let Some(current) = display.graphics() {
+            self.config.graphics.fullscreen = current.fullscreen;
+            self.config.graphics.display = current.display;
+            self.config.graphics.window_width = current.window_width;
+            self.config.graphics.window_height = current.window_height;
+        }
+    }
+
+    /// Apply windowed size, fullscreen and aspect to the live launcher window,
+    /// keeping the values `play` hands to the game in sync.
+    fn apply_window(&mut self, display: &mut Display) {
+        self.config.graphics = display.apply_window_options(self.config.graphics);
+    }
+
+    /// Persist the options file. A failure is logged but never blocks the
+    /// launcher: the change still applies for this run.
+    fn save_options(&self) {
+        let path = Config::default_path();
+        if let Err(err) = Config::save_options(
+            &path,
+            &self.config.graphics,
+            self.config.language.as_deref(),
+            self.config.game,
+        ) {
+            logging::write(&format!("warning: options not saved: {err:#}"));
+            eprintln!("warning: options not saved: {err:#}");
         }
     }
 
@@ -1779,6 +1926,7 @@ impl Launcher {
             Screen::Play => self.play_index = index,
             Screen::Update => self.update_index = index,
             Screen::Mods => self.mods_index = index,
+            Screen::Options => self.options_index = index,
             Screen::Install | Screen::Progress | Screen::Message => return,
         }
         self.activate(display);
@@ -1791,6 +1939,7 @@ impl Launcher {
             "install" => Screen::Install,
             "update" => Screen::Update,
             "mods" => Screen::Mods,
+            "options" => Screen::Options,
             "progress" => {
                 self.capture_progress = Some(ProgressState {
                     label: "roomcut".to_string(),
@@ -1910,6 +2059,10 @@ impl Launcher {
                     || kind == SDL_EVENT_WINDOW_EXPOSED
                     || kind == SDL_EVENT_WINDOW_FOCUS_GAINED
                 {
+                    if kind == SDL_EVENT_WINDOW_RESIZED {
+                        display.note_window_size();
+                        self.sync_window(display);
+                    }
                     dirty = true;
                 }
                 if !unsafe { SDL_PollEvent(&mut event) } {
@@ -1923,6 +2076,216 @@ impl Launcher {
         display.note_window_size();
         display.save_window();
     }
+}
+
+fn on_off(value: bool) -> String {
+    if value { "ON" } else { "OFF" }.to_string()
+}
+
+/// The text shown in the `VALUE` column for an `OPTIONS` row.
+fn option_value(config: &Config, index: usize) -> String {
+    let graphics = &config.graphics;
+    match index {
+        0 => graphics.renderer.name().to_ascii_uppercase(),
+        1 => format!(
+            "{} ({})",
+            if graphics.aspect.is_standard() {
+                "OFF"
+            } else {
+                "ON"
+            },
+            graphics.aspect.name()
+        ),
+        2 => resolution_label(graphics),
+        3 => on_off(graphics.fullscreen),
+        4 => language_label(config.language.as_deref()),
+        5 => format!("{}%", graphics.render_scale),
+        6 => format!("{}x", graphics.msaa),
+        7 => format!("{} FPS", graphics.frame_rate),
+        8 => on_off(config.game.quick_turn),
+        _ => on_off(config.game.tactical_reload),
+    }
+}
+
+/// Change one `OPTIONS` row. Returns whether the window must be re-applied.
+fn change_option(config: &mut Config, index: usize, delta: isize) -> bool {
+    match index {
+        0 => {
+            config.graphics.renderer = match config.graphics.renderer {
+                RendererKind::Gpu => RendererKind::Software,
+                RendererKind::Software => RendererKind::Gpu,
+            };
+            false
+        }
+        1 => {
+            let aspect = if config.graphics.aspect.is_standard() {
+                video::Aspect::WIDE
+            } else {
+                video::Aspect::STANDARD
+            };
+            let width = config.graphics.window_width;
+            config.graphics.aspect = aspect;
+            config.graphics.window_height =
+                ((u64::from(width) * u64::from(aspect.height()) + 160) / 320) as u32;
+            true
+        }
+        2 => {
+            step_resolution(&mut config.graphics, delta);
+            true
+        }
+        3 => {
+            config.graphics.fullscreen = !config.graphics.fullscreen;
+            true
+        }
+        4 => {
+            step_language(config, delta);
+            false
+        }
+        5 => {
+            config.graphics.render_scale =
+                step_value(&RENDER_SCALES, config.graphics.render_scale, delta);
+            false
+        }
+        6 => {
+            config.graphics.msaa = step_value(&video::MSAA_COUNTS, config.graphics.msaa, delta);
+            false
+        }
+        7 => {
+            config.graphics.frame_rate =
+                video::step_frame_rate(config.graphics.frame_rate, delta as i32);
+            false
+        }
+        8 => {
+            config.game.quick_turn = !config.game.quick_turn;
+            false
+        }
+        _ => {
+            config.game.tactical_reload = !config.game.tactical_reload;
+            false
+        }
+    }
+}
+
+/// Move to the next (or previous) window size for the current aspect.
+fn step_resolution(graphics: &mut video::Graphics, delta: isize) {
+    let presets = resolution_presets(graphics.aspect);
+    let current = presets.iter().position(|&(width, height)| {
+        width == graphics.window_width && height == graphics.window_height
+    });
+    let (width, height) = match current {
+        Some(index) => {
+            presets[(index as isize + delta).rem_euclid(presets.len() as isize) as usize]
+        }
+        None if delta < 0 => presets[presets.len() - 1],
+        None => presets[0],
+    };
+    graphics.window_width = width;
+    graphics.window_height = height;
+}
+
+/// Step the language through `SYSTEM` and every shipped language tag.
+fn step_language(config: &mut Config, delta: isize) {
+    let choices = language_choices();
+    let current = choices
+        .iter()
+        .position(|choice| choice.as_deref() == config.language.as_deref())
+        .unwrap_or(0);
+    let next = (current as isize + delta).rem_euclid(choices.len() as isize) as usize;
+    config.language = choices[next].clone();
+}
+
+/// The window-size presets matching `aspect`'s frame shape.
+fn resolution_presets(aspect: video::Aspect) -> &'static [(u32, u32)] {
+    if aspect.is_standard() {
+        &RESOLUTIONS_STANDARD
+    } else {
+        &RESOLUTIONS_WIDE
+    }
+}
+
+/// The resolution row's value, with the preset's whole-frame zoom.
+fn resolution_label(graphics: &video::Graphics) -> String {
+    let size = (graphics.window_width, graphics.window_height);
+    if resolution_presets(graphics.aspect).contains(&size) {
+        let scale = (size.1 / graphics.aspect.height().max(1)).max(1);
+        format!("{}x{} ({}x)", size.0, size.1, scale)
+    } else {
+        format!("{}x{} (CUSTOM)", size.0, size.1)
+    }
+}
+
+/// `SYSTEM`, then every shipped language tag in a stable, familiar order.
+fn language_choices() -> Vec<Option<String>> {
+    let mut tags: Vec<String> = crate::language::LANGUAGE_FILES
+        .iter()
+        .filter_map(|(entry, _)| {
+            entry
+                .strip_prefix("language/")?
+                .strip_suffix(".txt")
+                .map(str::to_string)
+        })
+        .collect();
+    tags.sort_by(|a, b| {
+        language_rank(a)
+            .cmp(&language_rank(b))
+            .then_with(|| a.cmp(b))
+    });
+    tags.dedup();
+    let mut choices = Vec::with_capacity(tags.len() + 1);
+    choices.push(None);
+    choices.extend(tags.into_iter().map(Some));
+    choices
+}
+
+fn language_rank(tag: &str) -> u8 {
+    match tag {
+        "en-US" => 0,
+        "ja-JP" => 1,
+        "fr-FR" => 2,
+        "de-DE" => 3,
+        "it-IT" => 4,
+        "es-ES" => 5,
+        "ru-RU" => 6,
+        "fi-FI" => 7,
+        _ => 8,
+    }
+}
+
+fn language_name(tag: &str) -> &str {
+    match tag {
+        "en-US" => "ENGLISH",
+        "ja-JP" => "JAPANESE",
+        "fr-FR" => "FRENCH",
+        "de-DE" => "GERMAN",
+        "it-IT" => "ITALIAN",
+        "es-ES" => "SPANISH",
+        "ru-RU" => "RUSSIAN",
+        "fi-FI" => "FINNISH",
+        _ => tag,
+    }
+}
+
+fn language_label(language: Option<&str>) -> String {
+    match language {
+        None => format!("SYSTEM ({})", crate::language::resolve_tag(None)),
+        Some(tag) => {
+            let name = language_name(tag);
+            if name.eq_ignore_ascii_case(tag) {
+                tag.to_string()
+            } else {
+                format!("{name} ({tag})")
+            }
+        }
+    }
+}
+
+/// The value after (or before) `current` in `values`, wrapping; a value that
+/// is not a preset starts at the first entry.
+fn step_value<T: Copy + PartialEq>(values: &[T], current: T, delta: isize) -> T {
+    let Some(index) = values.iter().position(|&value| value == current) else {
+        return values[0];
+    };
+    values[(index as isize + delta).rem_euclid(values.len() as isize) as usize]
 }
 
 /// Find every pack under the data roots, first root winning a duplicate id.
@@ -2277,6 +2640,65 @@ mod tests {
         assert_eq!(index, 0);
         step(&mut index, 0, 1);
         assert_eq!(index, 0);
+    }
+
+    #[test]
+    fn options_cycle_and_report_every_setting() {
+        let mut config = Config::default();
+        assert_eq!(option_value(&config, 0), "GPU");
+        assert_eq!(option_value(&config, 1), "OFF (4:3)");
+        assert_eq!(option_value(&config, 2), "960x720 (3x)");
+
+        assert!(!change_option(&mut config, 0, 1));
+        assert_eq!(config.graphics.renderer, RendererKind::Software);
+        assert_eq!(option_value(&config, 0), "SOFTWARE");
+        change_option(&mut config, 0, 1);
+        assert_eq!(config.graphics.renderer, RendererKind::Gpu);
+
+        assert!(change_option(&mut config, 1, 1));
+        assert_eq!(config.graphics.aspect, video::Aspect::WIDE);
+        assert_eq!(
+            (config.graphics.window_width, config.graphics.window_height),
+            (960, 540)
+        );
+        assert_eq!(option_value(&config, 1), "ON (16:9)");
+        assert!(change_option(&mut config, 2, 1));
+        assert_eq!(
+            (config.graphics.window_width, config.graphics.window_height),
+            (1280, 720)
+        );
+
+        assert!(change_option(&mut config, 3, 1));
+        assert!(config.graphics.fullscreen);
+        assert_eq!(option_value(&config, 3), "ON");
+        change_option(&mut config, 3, 1);
+        assert!(!config.graphics.fullscreen);
+
+        assert!(!change_option(&mut config, 4, 1));
+        assert_eq!(config.language.as_deref(), Some("en-US"));
+        assert_eq!(option_value(&config, 4), "ENGLISH (en-US)");
+        assert!(!change_option(&mut config, 5, 1));
+        assert_eq!(config.graphics.render_scale, 150);
+        assert!(!change_option(&mut config, 6, 1));
+        assert_eq!(config.graphics.msaa, 2);
+        assert!(!change_option(&mut config, 7, 1));
+        assert_eq!(config.graphics.frame_rate, 60);
+        assert!(!change_option(&mut config, 8, 1));
+        assert!(config.game.quick_turn);
+        assert!(!change_option(&mut config, 9, 1));
+        assert!(config.game.tactical_reload);
+
+        // A custom window size is labelled as such and steps to the first
+        // preset in the chosen direction.
+        config.graphics.aspect = video::Aspect::STANDARD;
+        config.graphics.window_width = 1000;
+        config.graphics.window_height = 700;
+        assert_eq!(option_value(&config, 2), "1000x700 (CUSTOM)");
+        step_resolution(&mut config.graphics, 1);
+        assert_eq!(
+            (config.graphics.window_width, config.graphics.window_height),
+            (960, 720)
+        );
     }
 
     #[test]

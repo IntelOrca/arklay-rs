@@ -366,11 +366,11 @@ pub fn centre(top: u32, height: u32, snap: bool) -> u32 {
 /// Which renderer an interactive window draws the gameplay scene with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RendererKind {
-    /// The software rasterizer, scaled to the window (the default).
-    #[default]
+    /// The software rasterizer, scaled to the window.
     Software,
-    /// The SDL_GPU scene renderer ([`crate::gpu`]); falls back to software
-    /// when no device is available.
+    /// The SDL_GPU scene renderer ([`crate::gpu`]) and the default; falls back
+    /// to software when no device is available or the device fails mid-game.
+    #[default]
     Gpu,
 }
 
@@ -418,7 +418,7 @@ pub struct Graphics {
 impl Default for Graphics {
     fn default() -> Self {
         Self {
-            renderer: RendererKind::Software,
+            renderer: RendererKind::Gpu,
             fullscreen: false,
             window_width: DEFAULT_WINDOW_SIZE.0,
             window_height: DEFAULT_WINDOW_SIZE.1,
@@ -578,6 +578,12 @@ pub fn step_window(graphics: &mut Graphics, room: (u32, u32)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_gpu_renderer_is_the_default() {
+        assert_eq!(Graphics::default().renderer, RendererKind::Gpu);
+        assert_eq!(RendererKind::default(), RendererKind::Gpu);
+    }
 
     #[test]
     fn an_hd_image_fills_the_frame_viewport_at_its_own_aspect() {

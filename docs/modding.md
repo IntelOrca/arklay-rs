@@ -285,8 +285,9 @@ pack never changes which texture a room shows, and it composes with any mod that
 replaces the originals. If the pixels a mod supplies hash to no file, the texture is
 drawn as loaded.
 
-Replacements are drawn by the GPU renderer (`--renderer gpu`) at their own
-resolution. The software renderer is 320x240 and keeps the originals.
+Replacements are drawn by the GPU renderer (the default; `--renderer
+software` opts out) at their own resolution. The software renderer is 320x240
+and keeps the originals.
 
 - A background or mask image is sampled from the replacement in place of the
   original. The replacement covers the texels its hash window covers: the whole

@@ -34,7 +34,10 @@ on the command line skips it and boots the game directly. The launcher finds
 Steam's RE1 install, creates or refreshes `games/re1.akpak`, plays a pack in
 the same window (closing the game window ends the process), discovers mods
 across the data roots and remembers their enable/disable state and order, and
-checks the release and nightly update tracks.
+checks the release and nightly update tracks. The OPTIONS screen edits the
+renderer, widescreen, resolution, fullscreen, language, GPU render scale and
+MSAA, frame rate, quick turn and tactical reload, writing every change back to
+`arklay.toml`.
 
 Updates publish a small `build.json` next to the platform binary. `release`
 follows the latest normal release; `nightly` follows the rolling pre-release
@@ -165,10 +168,10 @@ cargo run -- re1.akpak --room 100 --ticks 600 --stats
 # window and the actual presented rate is printed when it closes
 cargo run -- re1.akpak --room 100 --frame-rate 120 --stats
 
-# Draw the 3D scene on the GPU (SDL_GPU over Vulkan) at the window's
-# resolution, here at 150% of it with 4x MSAA; falls back to software without
-# a device. Captures and --stats always use the software renderer
-cargo run -- re1.akpak --renderer gpu --render-scale 150 --msaa 4
+# The 3D scene defaults to the GPU (SDL_GPU over Vulkan) at the window's
+# resolution; --renderer software or a failed device uses the 320x240
+# rasterizer instead. Captures and --stats always use software.
+cargo run -- re1.akpak --render-scale 150 --msaa 4
 
 # Port-only debug tools: press F1 while playing to freeze the room and open
 # the tool list (ROOM SELECT, INVENTORY, PLAYER, FLAGS, CHEATS, SAVE, ITEM BOX,
@@ -362,7 +365,7 @@ table of `arklay.toml`, so the next run opens the same way on the same screen:
 
 ```toml
 [graphics]
-renderer = "gpu"   # "software" (default) or "gpu"; --renderer overrides it
+renderer = "gpu"   # "gpu" (default) or "software"; --renderer overrides it
 fullscreen = false # borderless fullscreen (Alt+Enter)
 window_width = 960 # the window's client size in pixels (F8 sets multiples
 window_height = 720 # of 320x240); a window too big for its display shrinks

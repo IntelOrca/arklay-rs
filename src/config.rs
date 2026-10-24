@@ -31,7 +31,8 @@
 //! # default. F8 and Alt+Enter rewrite `fullscreen` and the window size, and
 //! # moving the window to another display rewrites `display`.
 //! [graphics]
-//! renderer = "software"  # or "gpu"; `--renderer` overrides it
+//! renderer = "gpu"       # or "software"; `--renderer` overrides it
+//!                        # (GPU is the default and falls back to software)
 //! fullscreen = false     # borderless fullscreen
 //! window_width = 960     # the window's client size in pixels (F8 picks
 //! window_height = 720    # multiples of 320x240; any size is letterboxed)
@@ -517,6 +518,22 @@ impl Config {
     /// keys. Rewritten like [`Config::save_bindings`].
     pub fn save_aspect(path: &Path, aspect: video::Aspect) -> Result<()> {
         Self::update(path, |config| config.graphics.aspect = aspect)
+    }
+
+    /// Persist the launcher's options: the whole `[graphics]` table, the
+    /// root `language` key and the `[game]` toggles. Rewritten like
+    /// [`Config::save_bindings`].
+    pub fn save_options(
+        path: &Path,
+        graphics: &Graphics,
+        language: Option<&str>,
+        game: Game,
+    ) -> Result<()> {
+        Self::update(path, |config| {
+            config.graphics = *graphics;
+            config.language = language.map(str::to_string);
+            config.game = game;
+        })
     }
 
     /// Read the file at `path` (a missing one is empty), apply `change` and
@@ -1502,6 +1519,46 @@ mod tests {
             },
             "only the window keys are written"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saving_options_writes_the_graphics_language_and_game_tables() {
+        let dir =
+            std::env::temp_dir().join(format!("arklay-config-{}-options", std::process::id()));
+        let path = dir.join("arklay.toml");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            &path,
+            "save_dir = \"/tmp/saves\"\n[mods]\ndisabled = [\"x\"]\n",
+        )
+        .unwrap();
+        let graphics = Graphics {
+            renderer: RendererKind::Software,
+            fullscreen: true,
+            window_width: 1920,
+            window_height: 1080,
+            display: 2,
+            render_scale: 150,
+            msaa: 4,
+            frame_rate: 144,
+            aspect: video::Aspect::WIDE,
+        };
+        let game = Game {
+            quick_turn: true,
+            tactical_reload: true,
+        };
+        Config::save_options(&path, &graphics, Some("ja-JP"), game).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("renderer = \"software\""), "{text}");
+        let (saved, warnings) = Config::load(&path);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(saved.graphics, graphics);
+        assert_eq!(saved.language.as_deref(), Some("ja-JP"));
+        assert_eq!(saved.game, game);
+        assert_eq!(saved.save_dir.as_deref(), Some(Path::new("/tmp/saves")));
+        assert_eq!(saved.mods.disabled, ["x"]);
         let _ = fs::remove_dir_all(&dir);
     }
 

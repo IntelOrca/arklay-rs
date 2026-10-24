@@ -210,10 +210,10 @@ struct Cli {
     stats: bool,
 
     /// Renderer for the interactive window's gameplay scene (default: the
-    /// config's `[graphics] renderer`, else software). `gpu` draws the 3D
-    /// scene with SDL_GPU at the window's resolution (it needs a Vulkan driver
-    /// and falls back to software without one). Captures, traces and
-    /// `--stats` always draw in software
+    /// config's `[graphics] renderer`, else GPU). `gpu` draws the 3D scene
+    /// with SDL_GPU at the window's resolution (it needs a Vulkan driver and
+    /// falls back to software without one). Captures, traces and `--stats`
+    /// always draw in software
     #[arg(long, value_enum, requires = "pack")]
     renderer: Option<RendererArg>,
 

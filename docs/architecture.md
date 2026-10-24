@@ -76,7 +76,7 @@ responsibility.
 |---|---|---|
 | `render` | Presentation | Deterministic software rasterizer: framebuffer, models, masks, shadows, effect billboards, lighting |
 | `raster` | Presentation | The reference's 3D triangle pipeline reproduced step for step, for llvmpipe-exact pixels |
-| `gpu` | Presentation | Optional interactive SDL_GPU renderer for the gameplay scene (`--renderer gpu`); never used by captures, traces or tests of record |
+| `gpu` | Presentation | Interactive SDL_GPU renderer for the gameplay scene (the default; software fallback); never used by captures, traces or tests of record |
 | `htexture` | Presentation | HD texture replacement by content hash (`htexture/`), including the loader cache-list mask pairing |
 | `video` | Presentation | The `[graphics]` options, the 4:3 viewport fit and the F8 window steps |
 | `tween` | Presentation | Presentation tweening for render rates above the 30 Hz simulation |
@@ -380,14 +380,15 @@ claims about the original.
 status matrix in `docs/status.md` records the counts a fresh verify reports for
 the shipped packs.
 
-## The optional GPU renderer
+## The GPU renderer
 
-`--renderer gpu` (or `[graphics] renderer = "gpu"`) draws the gameplay scene
-with SDL_GPU. It is interactive only: captures,
-traces, `--stats`, the oracle and every golden draw through the software
-rasterizer, which stays the reference. Without a usable device (the shaders
-are SPIR-V, so it needs Vulkan) the window warns and falls back to software;
-a failure while drawing or presenting does the same mid-game.
+The GPU renderer (the default; `--renderer software` or
+`[graphics] renderer = "software"` opts out) draws the gameplay scene with
+SDL_GPU. It is interactive only: captures, traces, `--stats`, the oracle and
+every golden draw through the software rasterizer, which stays the reference.
+Without a usable device (the shaders are SPIR-V, so it needs Vulkan) the
+window warns and falls back to software; a failure while drawing or
+presenting does the same mid-game.
 
 - **Resolutions.** Every frame is the 320x240 one; only its presentation
   varies. The window's client area is `window_width` x `window_height`
