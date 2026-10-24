@@ -27,10 +27,10 @@ use crate::config::UpdateChannel;
 
 /// The release channel's feed (the latest normal release).
 pub const RELEASE_FEED: &str =
-    "https://github.com/IntelOrca/arklay-rs/releases/latest/download/build.json";
+    "https://github.com/arklay-engine/arklay/releases/latest/download/build.json";
 /// The nightly channel's feed (the rolling pre-release).
 pub const NIGHTLY_FEED: &str =
-    "https://github.com/IntelOrca/arklay-rs/releases/download/nightly/build.json";
+    "https://github.com/arklay-engine/arklay/releases/download/nightly/build.json";
 /// A development override for the feed URL, used by local update tests.
 pub const FEED_ENV: &str = "ARKLAY_UPDATE_FEED";
 

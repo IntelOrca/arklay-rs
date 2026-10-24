@@ -85,9 +85,11 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build pkg-config \
             libasound2-dev libpulse-dev libx11-dev libxext-dev libxrandr-dev \
-            libxi-dev libxcursor-dev libxfixes-dev libxss-dev libwayland-dev \
-            libdecor-0-dev libgbm-dev libdrm-dev libudev-dev libdbus-1-dev \
-            libegl1-mesa-dev libgles2-mesa-dev
+            libxi-dev libxcursor-dev libxfixes-dev libxss-dev libxtst-dev \
+            libxinerama-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev wayland-protocols libdecor-0-dev libgbm-dev \
+            libdrm-dev libudev-dev libdbus-1-dev libunwind-dev \
+            libusb-1.0-0-dev libegl1-mesa-dev libgles2-mesa-dev
       - name: Build SDL3
         run: |
           git clone --depth 1 --branch release-3.4.16 https://github.com/libsdl-org/SDL sdl
