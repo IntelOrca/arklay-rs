@@ -209,14 +209,12 @@ pub fn build_mod(dir: &Path, out: &Path, base: Option<&Path>) -> Result<ModSumma
 /// Returns the paths in stable sorted order (lowercased file name, then full
 /// path) and an empty list when a directory is absent. A candidate present in
 /// both locations (for example through a symlink) is returned once.
-pub fn discover_mods(pack: &Path, global: Option<&Path>) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = Vec::with_capacity(2);
+pub fn discover_mods(pack: &Path, globals: &[PathBuf]) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::with_capacity(1 + globals.len());
     if let Some(dir) = pack.parent().map(|parent| parent.join("mods")) {
         dirs.push(dir);
     }
-    if let Some(dir) = global {
-        dirs.push(dir.to_path_buf());
-    }
+    dirs.extend(globals.iter().cloned());
 
     let mut mods: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
@@ -695,7 +693,7 @@ mod tests {
             mod_manifest_text("folder", "re1").as_bytes(),
         );
 
-        let found = discover_mods(&pack, None);
+        let found = discover_mods(&pack, &[]);
         assert_eq!(
             found
                 .iter()
@@ -704,7 +702,7 @@ mod tests {
             ["a.akpak", "b.AKPAK", "folder"]
         );
 
-        assert!(discover_mods(&dir.path.join("elsewhere/missing.akpak"), None).is_empty());
+        assert!(discover_mods(&dir.path.join("elsewhere/missing.akpak"), &[]).is_empty());
     }
 
     #[test]
@@ -721,7 +719,7 @@ mod tests {
         write(&global.join("nested/three.akpak"), b"three");
         write(&global.join("unrelated/data.bin"), b"data");
 
-        let found = discover_mods(&pack, Some(&global));
+        let found = discover_mods(&pack, std::slice::from_ref(&global));
         assert_eq!(
             found
                 .iter()
@@ -748,7 +746,7 @@ mod tests {
         #[cfg(not(unix))]
         write(&mods.join("link.akpak"), b"mod");
 
-        let found = discover_mods(&pack, None);
+        let found = discover_mods(&pack, &[]);
         assert_eq!(
             found
                 .iter()

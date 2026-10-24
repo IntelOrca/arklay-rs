@@ -1,3 +1,5 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -728,6 +730,12 @@ fn write_pack_info(pack_path: &Path, pack: &Pack, out: &mut impl Write) -> Resul
             if let Some(engine) = &manifest.engine {
                 writeln!(out, "  engine: {engine}")?;
             }
+            if let Some(version) = manifest.convert_version {
+                writeln!(out, "  convert_version: {version}")?;
+            }
+            if let Some(hash) = &manifest.source_hash {
+                writeln!(out, "  source_hash: {hash}")?;
+            }
             writeln!(out, "  rdt: {}", manifest.rdt_version)?;
             writeln!(out, "  scd: {}", manifest.scd_version)?;
             if !manifest.lua.is_empty() {
@@ -769,6 +777,7 @@ fn pack_info(pack_path: &Path, mods: &[PathBuf]) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    arklay::logging::init();
     let cli = Cli::parse();
 
     match cli.command {
@@ -799,7 +808,7 @@ fn main() -> Result<()> {
         },
         None => {
             let Some(pack) = cli.pack else {
-                bail!("a game pack is required (or use `arklay convert-game`)");
+                return arklay::launcher::run();
             };
             let tracing = cli.trace.is_some();
             let (config, warnings) = arklay::config::Config::load_default();
@@ -915,7 +924,7 @@ fn main() -> Result<()> {
                     disabled: config.mods.disabled.clone(),
                     order: config.mods.order.clone(),
                 },
-                global_dir: Some(arklay::config::Config::default_mods_dir()),
+                global_dirs: vec![arklay::config::Config::default_mods_dir()],
             };
             let trace_options = arklay::trace::TraceOptions {
                 path: cli.trace.as_deref(),
@@ -1494,7 +1503,7 @@ entries:
         // A directory game pack plus the per-user mods directory: only the
         // enabled mod applies.
         let options = arklay::engine::ModOptions {
-            global_dir: Some(global.clone()),
+            global_dirs: vec![global.clone()],
             layers: LayerOptions {
                 enabled: Some(vec!["one".into()]),
                 ..LayerOptions::default()
@@ -1507,7 +1516,7 @@ entries:
 
         // Config order names the later layer: `two` wins over `one`.
         let options = arklay::engine::ModOptions {
-            global_dir: Some(global),
+            global_dirs: vec![global],
             layers: LayerOptions {
                 order: vec!["one".into(), "two".into()],
                 ..LayerOptions::default()
@@ -1520,7 +1529,7 @@ entries:
         // `--no-mods` ignores the per-user directory too.
         let options = arklay::engine::ModOptions {
             no_mods: true,
-            global_dir: Some(dir.path.join("config/mods")),
+            global_dirs: vec![dir.path.join("config/mods")],
             ..arklay::engine::ModOptions::default()
         };
         let vanilla = arklay::engine::open_game_pack(&game_dir, &options, None).unwrap();

@@ -18,6 +18,8 @@
 //! string, so it stays cheap enough for per-entry updates.
 
 use std::io::{IsTerminal, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// How often a non-terminal reporter emits a plain progress line.
@@ -38,6 +40,30 @@ const ITEM_MAX_CHARS: usize = 44;
 /// [`SCALE`]. Integer fixed point keeps the reporter allocation- and
 /// float-free.
 const SCALE: u64 = 10_000;
+
+/// One progress update handed to an observer (the launcher's install screen).
+#[derive(Clone, Debug)]
+pub struct ProgressSnapshot {
+    /// The active phase's label.
+    pub label: String,
+    /// The item currently being processed, shortened for display.
+    pub item: String,
+    /// Units completed in the active phase.
+    pub done: u64,
+    /// Units in the active phase.
+    pub total: u64,
+    /// Phases completed.
+    pub phases_done: u64,
+    /// Phases the run will report.
+    pub phases_total: u64,
+    /// Overall fraction, from 0.0 to 1.0.
+    pub overall: f64,
+    /// Time since the reporter started.
+    pub elapsed: Duration,
+}
+
+/// A callback receiving progress updates on the conversion thread.
+pub type ProgressObserver = Box<dyn FnMut(ProgressSnapshot) + Send>;
 
 /// Tracks one overall bar across the phases of a run.
 pub struct Progress {
@@ -67,6 +93,12 @@ pub struct Progress {
     tty: bool,
     /// Whether the terminal cursor is currently hidden by the bar.
     cursor_hidden: bool,
+    /// A callback for a graphical reporter; when present, nothing is printed.
+    observer: Option<ProgressObserver>,
+    /// Suppress terminal output even when stderr is a terminal.
+    silent: bool,
+    /// Lets the caller abort a long conversion.
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl Progress {
@@ -74,6 +106,28 @@ impl Progress {
     /// when the count is not known yet and call [`Progress::set_phases`] before
     /// the first [`Progress::begin`].
     pub fn new(title: &str, phases: u64) -> Self {
+        Self::build(title, phases, None, None)
+    }
+
+    /// Create a reporter that hands every update to `observer` instead of
+    /// drawing on stderr, and that stops when `cancel` is set.
+    pub fn observed(
+        title: &str,
+        phases: u64,
+        observer: ProgressObserver,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Self {
+        let mut progress = Self::build(title, phases, Some(observer), cancel);
+        progress.silent = true;
+        progress
+    }
+
+    fn build(
+        title: &str,
+        phases: u64,
+        observer: Option<ProgressObserver>,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Self {
         let now = Instant::now();
         Self {
             started: now,
@@ -89,12 +143,52 @@ impl Progress {
             active: false,
             tty: std::io::stderr().is_terminal(),
             cursor_hidden: false,
+            observer,
+            silent: false,
+            cancel,
         }
     }
 
     /// Set the total number of phases the run will report, once known.
     pub fn set_phases(&mut self, phases: u64) {
         self.phases_total = phases;
+        self.observe();
+    }
+
+    /// Attach a cancellation flag to a terminal reporter.
+    pub fn set_cancel(&mut self, cancel: Arc<AtomicBool>) {
+        self.cancel = Some(cancel);
+    }
+
+    /// Whether the caller has asked the run to stop.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+    }
+
+    /// A copy of the current state for an observer.
+    pub fn snapshot(&self) -> ProgressSnapshot {
+        ProgressSnapshot {
+            label: self.label.clone(),
+            item: self.item.clone(),
+            done: self.done,
+            total: self.total,
+            phases_done: self.phases_done,
+            phases_total: self.phases_total,
+            overall: self.overall_scaled() as f64 / SCALE as f64,
+            elapsed: self.started.elapsed(),
+        }
+    }
+
+    fn observe(&mut self) {
+        if self.observer.is_none() {
+            return;
+        }
+        let snapshot = self.snapshot();
+        if let Some(observer) = self.observer.as_mut() {
+            observer(snapshot);
+        }
     }
 
     /// Begin a phase of `total` units, ending any previous phase.
@@ -112,9 +206,10 @@ impl Progress {
         self.item.clear();
         self.last_plain = Instant::now();
         self.active = true;
-        if total > 0 && self.tty {
+        if total > 0 && self.tty && !self.silent {
             self.draw_tty();
         }
+        self.observe();
     }
 
     /// Advance the active phase by one item, naming the item just processed.
@@ -135,14 +230,17 @@ impl Progress {
             return;
         }
         self.done = self.done.saturating_add(count);
-        if self.tty {
-            self.draw_tty();
-        } else if self.total > 0
-            && self.done < self.total
-            && self.last_plain.elapsed() >= PLAIN_INTERVAL
-        {
-            self.draw_plain();
+        if !self.silent {
+            if self.tty {
+                self.draw_tty();
+            } else if self.total > 0
+                && self.done < self.total
+                && self.last_plain.elapsed() >= PLAIN_INTERVAL
+            {
+                self.draw_plain();
+            }
         }
+        self.observe();
     }
 
     /// Finish the active phase.
@@ -158,9 +256,10 @@ impl Progress {
         if self.phases_total > 0 && self.phases_done < self.phases_total {
             self.phases_done += 1;
         }
-        if self.tty && self.total > 0 {
+        if self.tty && self.total > 0 && !self.silent {
             self.draw_tty();
         }
+        self.observe();
     }
 
     /// End the active phase, settle the final line and erase it.
@@ -181,6 +280,7 @@ impl Progress {
             self.phases_done = self.phases_total;
             self.done = self.total;
         }
+        self.observe();
         self.clear();
     }
 
@@ -188,7 +288,7 @@ impl Progress {
     /// the run's own output can carry on. A no-op when nothing was drawn
     /// (redirected) or already cleared.
     fn clear(&mut self) {
-        if !self.tty {
+        if !self.tty || self.silent {
             return;
         }
         if self.line_len == 0 && !self.cursor_hidden {
@@ -512,6 +612,36 @@ mod tests {
         progress.end_phase();
         assert_eq!(progress.phases_done(), 1);
         assert_eq!(progress.overall_scaled(), SCALE / 2);
+    }
+
+    #[test]
+    fn an_observer_sees_phases_and_cancellation() {
+        use std::sync::Mutex;
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut progress = Progress::observed(
+            "install",
+            2,
+            Box::new(move |snapshot| sink.lock().unwrap().push(snapshot)),
+            Some(Arc::clone(&cancel)),
+        );
+        progress.begin("scan", 2);
+        progress.advance("a");
+        progress.end_phase();
+        progress.begin("copy", 4);
+        progress.advance("b");
+        progress.end_phase();
+        progress.finish();
+
+        let seen = seen.lock().unwrap();
+        assert!(seen.iter().any(|s| s.label == "copy" && s.done == 1));
+        assert!(seen.last().unwrap().overall > 0.9);
+        assert!(seen.iter().all(|s| s.phases_total == 2));
+        assert!(!progress.is_cancelled());
+        cancel.store(true, Ordering::Relaxed);
+        assert!(progress.is_cancelled());
     }
 
     #[test]

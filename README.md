@@ -27,6 +27,38 @@ The `hd` feature (also default) pulls the pure-Rust `png`, `image-webp` and
 `lewton` crates that decode a mod's replacement art and audio; without it the
 engine still resolves replacements by stem but refuses to decode those formats.
 
+## Launcher
+
+Running `arklay` with no arguments opens the startup launcher. Naming a pack
+on the command line skips it and boots the game directly. The launcher finds
+Steam's RE1 install, creates or refreshes `games/re1.akpak`, plays a pack in
+the same window (closing the game window ends the process), discovers mods
+across the data roots and remembers their enable/disable state and order, and
+checks the release and nightly update tracks.
+
+Updates publish a small `build.json` next to the platform binary. `release`
+follows the latest normal release; `nightly` follows the rolling pre-release
+that CI replaces on every push to `main`. The launcher verifies the download's
+SHA-256, swaps the executable while keeping `<exe>.old`, and restarts; the
+Update screen can restore that previous image. Only CI builds (with
+`ARKLAY_CHANNEL` baked in) update themselves, so a local `cargo build` shows
+`DEV BUILD` instead. The Linux binary expects SDL3 to be installed on the
+system; Windows links SDL3 statically.
+
+Data resolves by precedence:
+
+- configuration and saves: `%APPDATA%\arklay` on Windows,
+  `$XDG_CONFIG_HOME/arklay` on Linux; an existing `arklay.toml` in the local
+  data directory takes over instead
+- games, mods and logs: `%LOCALAPPDATA%\arklay` (`$XDG_DATA_HOME/arklay`)
+- `ARKLAY_DATA=C:\one;C:\two` replaces the data-root list entirely, with the
+  first path chosen for new files; otherwise the order is the local data
+  directory, the roaming directory, then the executable's directory
+- `ARKLAY_CONFIG_DIR` relocates configuration and saves
+
+The launcher's text face is [Departure Mono](https://github.com/rektdeckard/departure-mono),
+MIT licensed; the notice is in `assets/DepartureMono-LICENSE`.
+
 ## Usage
 
 ```sh

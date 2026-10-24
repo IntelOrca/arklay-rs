@@ -26,6 +26,7 @@ hd = [
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+fontdue = "0.9"
 image-webp = { version = "0.2", optional = true }
 lewton = { version = "0.10", optional = true }
 mlua = { version = "0.10", default-features = false, features = [
@@ -36,13 +37,24 @@ mlua = { version = "0.10", default-features = false, features = [
 # MSRV.
 openh264 = { version = "=0.9.3", optional = true }
 png = { version = "0.18", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
 sdl3-sys = { version = "0.7", default-features = false }
 symphonia-codec-aac = { version = "0.6", optional = true }
 symphonia-core = { version = "0.6", default-features = false, optional = true }
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
 zstd = "0.13"
 
 [target.'cfg(windows)'.dependencies]
 sdl3-sys = { version = "0.7", default-features = false, features = ["build-from-source-static"] }
+winreg = "0.55"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+] }
 
 [lints.rust]
 warnings = "deny"

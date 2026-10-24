@@ -84,6 +84,13 @@ pub struct Manifest {
     pub language: Option<String>,
     /// Optional note about the engine build this pack targets.
     pub engine: Option<String>,
+    /// The conversion revision that produced the pack; a launcher compares
+    /// it with [`crate::convert::CONVERT_VERSION`]. Older packs do not carry
+    /// it.
+    pub convert_version: Option<u32>,
+    /// A fingerprint of the engine-owned scripts and language sources that
+    /// were packed; see [`crate::convert::packed_source_hash`].
+    pub source_hash: Option<String>,
     /// Explicit Lua hook paths, in load order.
     pub lua: Vec<String>,
 }
@@ -103,6 +110,8 @@ impl Manifest {
             scd_version: DEFAULT_SCD_VERSION.to_string(),
             language: None,
             engine: None,
+            convert_version: None,
+            source_hash: None,
             lua: Vec::new(),
         }
     }
@@ -130,6 +139,8 @@ impl Manifest {
         let mut scd_version = None;
         let mut language = None;
         let mut engine = None;
+        let mut convert_version = None;
+        let mut source_hash = None;
         let mut lua = None;
         let mut seen: HashSet<String> = HashSet::new();
 
@@ -189,6 +200,15 @@ impl Manifest {
                 "scd" => scd_version = Some(non_empty_string(item, "scd")?),
                 "language" => language = Some(non_empty_string(item, "language")?),
                 "engine" => engine = Some(string_value(item, "engine")?),
+                "convert_version" => {
+                    let Value::Integer(value) = item.value else {
+                        bail!("manifest.toml line {line}: `convert_version` must be an integer");
+                    };
+                    convert_version = Some(u32::try_from(value).map_err(|_| {
+                        anyhow!("manifest.toml line {line}: bad convert_version {value}")
+                    })?);
+                }
+                "source_hash" => source_hash = Some(non_empty_string(item, "source_hash")?),
                 "lua" => {
                     let Value::Array(values) = item.value else {
                         bail!("manifest.toml line {line}: `lua` must be a string array");
@@ -226,6 +246,8 @@ impl Manifest {
             scd_version: scd_version.unwrap_or_else(|| DEFAULT_SCD_VERSION.to_string()),
             language,
             engine,
+            convert_version,
+            source_hash,
             lua: lua.unwrap_or_default(),
         })
     }
@@ -260,6 +282,12 @@ impl Manifest {
         }
         if let Some(engine) = &self.engine {
             write_pair(&mut out, "engine", &quote(engine));
+        }
+        if let Some(version) = self.convert_version {
+            write_pair(&mut out, "convert_version", &version.to_string());
+        }
+        if let Some(hash) = &self.source_hash {
+            write_pair(&mut out, "source_hash", &quote(hash));
         }
         if !self.lua.is_empty() {
             let entries: Vec<String> = self.lua.iter().map(|path| quote(path)).collect();
@@ -569,6 +597,8 @@ mod tests {
             scd_version: DEFAULT_SCD_VERSION.to_string(),
             language: None,
             engine: Some("arklay 0.1.0".to_string()),
+            convert_version: None,
+            source_hash: None,
             lua: Vec::new(),
         }
     }
@@ -586,6 +616,8 @@ mod tests {
             scd_version: DEFAULT_SCD_VERSION.to_string(),
             language: None,
             engine: None,
+            convert_version: None,
+            source_hash: None,
             lua: vec!["lua/demo.lua".to_string(), "lua/extra.lua".to_string()],
         }
     }
@@ -686,6 +718,8 @@ lua = [\"lua/a.lua\", \"lua/b.lua\"]
             scd_version: "re1".to_string(),
             language: Some("ja-JP".to_string()),
             engine: Some("arklay 0.1.0".to_string()),
+            convert_version: None,
+            source_hash: None,
             lua: vec!["lua/a.lua".to_string(), "lua/b.lua".to_string()],
         }
     }

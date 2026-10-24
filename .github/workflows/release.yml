@@ -1,0 +1,167 @@
+name: Release and nightly
+
+# A push to main refreshes the rolling `nightly` pre-release; a v* tag cuts a
+# normal release. Both publish the same build.json shape and the two platform
+# binaries the launcher's updater consumes.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      channel: ${{ steps.meta.outputs.channel }}
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version=$(grep -m1 '^version = ' Cargo.toml | cut -d '"' -f2)
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            tag_version="${GITHUB_REF_NAME#v}"
+            if [[ "$tag_version" != "$cargo_version" ]]; then
+              echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $cargo_version" >&2
+              exit 1
+            fi
+            echo "channel=release" >> "$GITHUB_OUTPUT"
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "version=$tag_version" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "channel=nightly" >> "$GITHUB_OUTPUT"
+            echo "tag=nightly" >> "$GITHUB_OUTPUT"
+            echo "version=${cargo_version}-nightly" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  windows:
+    needs: prepare
+    runs-on: windows-latest
+    env:
+      ARKLAY_CHANNEL: ${{ needs.prepare.outputs.channel }}
+      ARKLAY_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Stage
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/arklay.exe dist/arklay-windows-x86_64.exe
+          (Get-FileHash dist/arklay-windows-x86_64.exe -Algorithm SHA256).Hash.ToLower() |
+            Set-Content dist/arklay-windows-x86_64.exe.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+          if-no-files-found: error
+
+  linux:
+    needs: prepare
+    runs-on: ubuntu-latest
+    env:
+      ARKLAY_CHANNEL: ${{ needs.prepare.outputs.channel }}
+      ARKLAY_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install SDL build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build pkg-config \
+            libasound2-dev libpulse-dev libx11-dev libxext-dev libxrandr-dev \
+            libxi-dev libxcursor-dev libxfixes-dev libxss-dev libwayland-dev \
+            libdecor-0-dev libgbm-dev libdrm-dev libudev-dev libdbus-1-dev \
+            libegl1-mesa-dev libgles2-mesa-dev
+      - name: Build SDL3
+        run: |
+          git clone --depth 1 --branch release-3.4.16 https://github.com/libsdl-org/SDL sdl
+          cmake -S sdl -B sdl-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DSDL_SHARED=ON -DSDL_STATIC=OFF
+          cmake --build sdl-build
+          sudo cmake --install sdl-build
+          sudo ldconfig
+      - name: Build arklay
+        env:
+          SDL3_DIR: /usr/local
+          PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
+        run: cargo build --release
+      - name: Stage
+        run: |
+          mkdir -p dist
+          cp target/release/arklay dist/arklay-linux-x86_64
+          sha256sum dist/arklay-linux-x86_64 | cut -d' ' -f1 > dist/arklay-linux-x86_64.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux
+          path: dist
+      - name: Write build.json
+        env:
+          CHANNEL: ${{ needs.prepare.outputs.channel }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          tag = os.environ["TAG"]
+          base = f"https://github.com/{os.environ['REPO']}/releases/download/{tag}"
+          def asset(name):
+              with open(f"dist/{name}.sha256") as f:
+                  return {"url": f"{base}/{name}", "sha256": f.read().strip().lower()}
+          feed = {
+              "channel": os.environ["CHANNEL"],
+              "version": os.environ["VERSION"],
+              "sha": os.environ["SHA"],
+              "assets": {
+                  "windows-x86_64": asset("arklay-windows-x86_64.exe"),
+                  "linux-x86_64": asset("arklay-linux-x86_64"),
+              },
+          }
+          with open("dist/build.json", "w") as f:
+              json.dump(feed, f, indent=2)
+          PY
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.tag }}
+          prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
+          overwrite_files: true
+          files: |
+            dist/arklay-windows-x86_64.exe
+            dist/arklay-windows-x86_64.exe.sha256
+            dist/arklay-linux-x86_64
+            dist/arklay-linux-x86_64.sha256
+            dist/build.json

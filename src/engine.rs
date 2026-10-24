@@ -84,9 +84,11 @@ use sdl3_sys::timer::{SDL_DelayNS, SDL_GetTicksNS};
 use sdl3_sys::video::{
     SDL_CreateWindow, SDL_DestroyWindow, SDL_DisplayID, SDL_GetDisplayForWindow,
     SDL_GetDisplayUsableBounds, SDL_GetDisplays, SDL_GetPrimaryDisplay, SDL_GetWindowBordersSize,
-    SDL_GetWindowPixelDensity, SDL_SetWindowFullscreen, SDL_SetWindowFullscreenMode,
-    SDL_SetWindowPosition, SDL_SetWindowSize, SDL_SetWindowTitle, SDL_ShowWindow, SDL_SyncWindow,
-    SDL_WINDOW_HIDDEN, SDL_WINDOWPOS_CENTERED_DISPLAY, SDL_Window, SDL_WindowFlags,
+    SDL_GetWindowPixelDensity, SDL_GetWindowSize, SDL_GetWindowSizeInPixels,
+    SDL_SetWindowFullscreen, SDL_SetWindowFullscreenMode, SDL_SetWindowMinimumSize,
+    SDL_SetWindowPosition, SDL_SetWindowResizable, SDL_SetWindowSize, SDL_SetWindowTitle,
+    SDL_ShowWindow, SDL_SyncWindow, SDL_WINDOW_HIDDEN, SDL_WINDOWPOS_CENTERED_DISPLAY, SDL_Window,
+    SDL_WindowFlags,
 };
 
 use crate::anim;
@@ -747,8 +749,8 @@ fn active_entities(game: &game::GameState) -> usize {
 ///
 /// `explicit` holds the `--mod` paths (always applied), `no_mods` ignores both
 /// the explicit and the discovered layers, `layers` is the user config's
-/// enable/disable/order selection over discovered mods, and `global_dir` is
-/// the per-user `mods/` directory (`None` disables that discovery, which keeps
+/// enable/disable/order selection over discovered mods, and `global_dirs`
+/// are the extra mod directories (`[]` disables that discovery, which keeps
 /// library/tests runs isolated).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModOptions {
@@ -758,15 +760,15 @@ pub struct ModOptions {
     pub no_mods: bool,
     /// The config's selection and order for discovered mods.
     pub layers: LayerOptions,
-    /// The per-user mods directory to scan in addition to the pack's sibling
-    /// `mods/` directory.
-    pub global_dir: Option<PathBuf>,
+    /// Extra mod directories to scan in addition to the pack's sibling
+    /// `mods/` directory, in precedence order.
+    pub global_dirs: Vec<PathBuf>,
 }
 
 /// Open a game pack together with its runtime mod layers.
 ///
 /// Unless `options.no_mods` is set, the pack's sibling `mods/` directory and
-/// `options.global_dir` are scanned for `.akpak` files and mod source
+/// `options.global_dirs` are scanned for `.akpak` files and mod source
 /// directories; `options.explicit` adds the `--mod` layers. The config's
 /// [`LayerOptions`] filters and orders the discovered layers, while an
 /// explicit layer always applies. A layer discovered and also passed
@@ -788,7 +790,7 @@ pub fn open_game_pack(path: &Path, options: &ModOptions, language: Option<&str>)
     }
     let mut candidates: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
-    for layer in crate::modding::discover_mods(path, options.global_dir.as_deref()) {
+    for layer in crate::modding::discover_mods(path, &options.global_dirs) {
         let canonical = std::fs::canonicalize(&layer).unwrap_or_else(|_| layer.clone());
         if seen.insert(canonical) {
             candidates.push(layer);
@@ -1053,13 +1055,15 @@ enum Backend {
     },
     /// The SDL_GPU device, which owns the window's swapchain.
     Gpu(Box<GpuRenderer>),
+    /// Held only while a backend is being replaced; never presented.
+    None,
 }
 
 /// The SDL window and the backend every screen shares.
 ///
 /// The guards are declared before the raw window pointer so the backend,
 /// window and SDL tear down in that order.
-struct Display {
+pub(crate) struct Display {
     backend: Backend,
     _window: WindowHandle,
     _sdl: SdlHandle,
@@ -1073,7 +1077,7 @@ impl Display {
     /// Open the window `graphics` describes (see [`crate::video`]); `capture`
     /// instead opens a fixed 960x720 window on SDL's offscreen software
     /// driver for headless captures, which ignore `graphics`.
-    fn new(title: &str, capture: bool, graphics: Graphics) -> Result<Self> {
+    pub(crate) fn new(title: &str, capture: bool, graphics: Graphics) -> Result<Self> {
         if capture {
             unsafe {
                 SDL_SetHint(SDL_HINT_VIDEO_DRIVER, c"offscreen".as_ptr());
@@ -1159,7 +1163,7 @@ impl Display {
     }
 
     /// Alt+Enter: toggle borderless fullscreen and the window.
-    fn toggle_fullscreen(&mut self) {
+    pub(crate) fn toggle_fullscreen(&mut self) {
         let window = self.window;
         let Some(graphics) = self.graphics.as_mut() else {
             return;
@@ -1187,7 +1191,7 @@ impl Display {
 
     /// Persist the window options to `arklay.toml`; a failure is reported and
     /// the change still applies for this run.
-    fn save_window(&self) {
+    pub(crate) fn save_window(&self) {
         let Some(graphics) = &self.graphics else {
             return;
         };
@@ -1259,8 +1263,45 @@ impl Display {
     fn gpu(&mut self) -> Option<&mut GpuRenderer> {
         match &mut self.backend {
             Backend::Gpu(gpu) => Some(gpu),
-            Backend::Software { .. } => None,
+            Backend::Software { .. } | Backend::None => None,
         }
+    }
+
+    /// Switch the window to the backend `graphics` selects, keeping the
+    /// window itself (the launcher hands it to the game). A GPU failure falls
+    /// back to software, exactly like `Display::new`.
+    pub(crate) fn set_renderer(&mut self, graphics: Graphics) -> Result<()> {
+        let want_gpu = graphics.renderer == RendererKind::Gpu;
+        let is_gpu = matches!(self.backend, Backend::Gpu(_));
+        if want_gpu != is_gpu || matches!(self.backend, Backend::None) {
+            let old = std::mem::replace(&mut self.backend, Backend::None);
+            if let Backend::Gpu(mut gpu) = old {
+                gpu.release_window();
+                drop(gpu);
+            } else {
+                drop(old);
+            }
+            self.backend = if want_gpu {
+                match unsafe { GpuRenderer::new(self.window, graphics.render_scale, graphics.msaa) }
+                {
+                    Ok(gpu) => Backend::Gpu(Box::new(gpu)),
+                    Err(err) => {
+                        eprintln!("warning: GPU renderer unavailable ({err:#}); using software");
+                        Self::software_backend(self.window)?
+                    }
+                }
+            } else {
+                Self::software_backend(self.window)?
+            };
+        }
+        let Some(current) = self.graphics.as_mut() else {
+            return Ok(());
+        };
+        *current = graphics;
+        if !matches!(self.backend, Backend::Gpu(_)) {
+            current.renderer = RendererKind::Software;
+        }
+        Ok(())
     }
 
     /// Upload the framebuffer and draw it scaled to the window.
@@ -1279,6 +1320,7 @@ impl Display {
                 Ok(()) => Ok(()),
                 Err(err) => self.fall_back_to_software(&err),
             },
+            Backend::None => bail!("display has no renderer"),
         }
     }
 
@@ -1300,6 +1342,7 @@ impl Display {
                     Err(err) => self.fall_back_to_software(&err),
                 }
             }
+            Backend::None => bail!("display has no renderer"),
         }
     }
 
@@ -1317,7 +1360,7 @@ impl Display {
 
     /// Flip the drawn backbuffer to the screen. The GPU backend presents in
     /// [`Display::present_layers`].
-    fn show(&self) -> Result<()> {
+    pub(crate) fn show(&self) -> Result<()> {
         if let Backend::Software { renderer, .. } = &self.backend
             && !unsafe { SDL_RenderPresent(renderer.0) }
         {
@@ -1326,11 +1369,135 @@ impl Display {
         Ok(())
     }
 
+    /// The window options currently in force, when this is an interactive
+    /// window.
+    pub(crate) fn graphics(&self) -> Option<&Graphics> {
+        self.graphics.as_ref()
+    }
+
+    /// Upload a native-resolution UI frame and draw it one-to-one over the
+    /// whole window. The launcher draws at the window's pixel size, so this
+    /// needs no viewport math; the software backend is the only one the
+    /// launcher opens.
+    pub(crate) fn present_ui(&mut self, width: u32, height: u32, rgba: &[u8]) -> Result<()> {
+        if width == 0 || height == 0 || rgba.len() != width as usize * height as usize * 4 {
+            bail!(
+                "launcher frame is {} bytes, expected {}x{}x4",
+                rgba.len(),
+                width,
+                height
+            );
+        }
+        let Backend::Software { texture, renderer } = &mut self.backend else {
+            bail!("the launcher needs the software renderer");
+        };
+        let texture = texture.fit(renderer.0, width, height)?;
+        if !unsafe {
+            SDL_UpdateTexture(
+                texture,
+                std::ptr::null(),
+                rgba.as_ptr().cast::<c_void>(),
+                width as i32 * 4,
+            )
+        } {
+            bail!("SDL_UpdateTexture failed: {}", sdl_error());
+        }
+        if !unsafe { SDL_RenderClear(renderer.0) } {
+            bail!("SDL_RenderClear failed: {}", sdl_error());
+        }
+        let (mut out_width, mut out_height) = (0, 0);
+        if !unsafe { SDL_GetCurrentRenderOutputSize(renderer.0, &mut out_width, &mut out_height) } {
+            bail!("SDL_GetCurrentRenderOutputSize failed: {}", sdl_error());
+        }
+        let source = SDL_FRect {
+            x: 0.0,
+            y: 0.0,
+            w: width as f32,
+            h: height as f32,
+        };
+        let destination = SDL_FRect {
+            x: 0.0,
+            y: 0.0,
+            w: out_width.max(1) as f32,
+            h: out_height.max(1) as f32,
+        };
+        if !unsafe { SDL_RenderTexture(renderer.0, texture, &source, &destination) } {
+            bail!("SDL_RenderTexture failed: {}", sdl_error());
+        }
+        Ok(())
+    }
+
+    /// Let the user drag the launcher's window to any size at or above a
+    /// usable minimum; the game windows stay non-resizable.
+    pub(crate) fn set_resizable(&mut self, resizable: bool) {
+        unsafe {
+            SDL_SetWindowResizable(self.window, resizable);
+            if resizable {
+                SDL_SetWindowMinimumSize(self.window, 640, 480);
+            }
+        }
+    }
+
+    /// The raw SDL window, for the folder picker.
+    pub(crate) fn window_ptr(&self) -> *mut SDL_Window {
+        self.window
+    }
+
+    /// The window's client size in window coordinates (before the display
+    /// scale), which is what SDL's mouse events use.
+    pub(crate) fn window_size(&self) -> (u32, u32) {
+        let (mut width, mut height) = (0, 0);
+        if unsafe { SDL_GetWindowSize(self.window, &mut width, &mut height) }
+            && width > 0
+            && height > 0
+        {
+            return (width as u32, height as u32);
+        }
+        (0, 0)
+    }
+
+    /// The window's drawable size in pixels.
+    pub(crate) fn drawable_size(&self) -> (u32, u32) {
+        let (mut width, mut height) = (0, 0);
+        if unsafe { SDL_GetWindowSizeInPixels(self.window, &mut width, &mut height) }
+            && width > 0
+            && height > 0
+        {
+            return (width as u32, height as u32);
+        }
+        let (mut width, mut height) = (0, 0);
+        if unsafe { SDL_GetWindowSize(self.window, &mut width, &mut height) }
+            && width > 0
+            && height > 0
+        {
+            return (width as u32, height as u32);
+        }
+        (0, 0)
+    }
+
+    /// Record the windowed size the user dragged the launcher to, so the next
+    /// run opens at it. Fullscreen sizes are owned by the display.
+    pub(crate) fn note_window_size(&mut self) {
+        let (width, height) = self.drawable_size();
+        let Some(graphics) = self.graphics.as_mut() else {
+            return;
+        };
+        if graphics.fullscreen {
+            return;
+        }
+        if width > 0 && height > 0 {
+            graphics.window_width = width;
+            graphics.window_height = height;
+        }
+    }
+
     /// Read the drawn frame back and write it as a BMP.
     fn capture(&self, path: &Path) -> Result<()> {
         match &self.backend {
             Backend::Software { renderer, .. } => capture_frame(renderer.0, path),
-            Backend::Gpu(_) => bail!("captures always use the software renderer"),
+            Backend::Gpu(_) | Backend::None => {
+                bail!("captures always use the software renderer")
+            }
         }
     }
 }
@@ -7782,6 +7949,7 @@ pub fn run_ui_with_mods(
         player_options,
         trace,
         authoring,
+        None,
     )
 }
 
@@ -7813,6 +7981,40 @@ pub fn run_root(
             renderer,
             ..Authoring::default()
         },
+        None,
+    )
+}
+
+/// The root boot on a window the caller already owns. The launcher uses this
+/// to hand its window to the game without ever opening a second one; closing
+/// the game window ends the process.
+#[allow(clippy::too_many_arguments)] // mirrors run_root
+pub(crate) fn run_root_with_display(
+    pack: &Path,
+    capture: Option<&Path>,
+    save_dir: &Path,
+    mods: &ModOptions,
+    debug_menu: bool,
+    language: Option<&str>,
+    renderer: Graphics,
+    player_options: player::Options,
+    display: &mut Display,
+) -> Result<()> {
+    run_ui_impl(
+        pack,
+        AppBoot::Boot,
+        capture,
+        save_dir,
+        mods,
+        debug_menu,
+        language,
+        player_options,
+        trace::TraceOptions::default(),
+        Authoring {
+            renderer,
+            ..Authoring::default()
+        },
+        Some(display),
     )
 }
 
@@ -7860,6 +8062,7 @@ fn run_ui_impl(
     player_options: player::Options,
     trace: trace::TraceOptions<'_>,
     authoring: Authoring<'_>,
+    shared: Option<&mut Display>,
 ) -> Result<()> {
     if capture.is_some()
         || trace.path.is_some()
@@ -8054,8 +8257,12 @@ fn run_ui_impl(
     } else if authoring.setup_script.is_some() {
         bail!("--setup-script requires a boot that opens a game session");
     }
-    let mut display = Display::new("Arklay", false, authoring.renderer)?;
-    run_app_loop(&mut app, &mut display, false)
+    let mut owned = None;
+    let display = match shared {
+        Some(display) => display,
+        None => owned.insert(Display::new("Arklay", false, authoring.renderer)?),
+    };
+    run_app_loop(&mut app, display, false)
 }
 
 /// Play a scripted `--input` over an app-level `--ui` boot (the title, the
