@@ -1,7 +1,7 @@
 //! Pack manifest (`manifest.toml`).
 //!
 //! The manifest is an ordinary pack entry that describes its pack: the format
-//! version, a stable id, a human name and version, whether the pack is a base
+//! version, a stable id, a human name, version and description, whether the pack is a base
 //! or a mod, the base id a mod shadows, the layer order mods sort by, the RDT
 //! and SCD dialects it carries, the language of its own room text, a free-form
 //! engine note and the explicit Lua hook list.
@@ -67,6 +67,8 @@ pub struct Manifest {
     pub name: Option<String>,
     /// Pack version string.
     pub version: Option<String>,
+    /// Free-form description shown to players, e.g. credits or a seed.
+    pub description: Option<String>,
     /// Whether this is the base pack or a mod.
     pub kind: PackKind,
     /// Mods: the base pack id this mod layers over.
@@ -103,6 +105,7 @@ impl Manifest {
             id: id.into(),
             name: None,
             version: None,
+            description: None,
             kind: PackKind::Base,
             base: None,
             load_order: 0,
@@ -132,6 +135,7 @@ impl Manifest {
         let mut id = None;
         let mut name = None;
         let mut version = None;
+        let mut description = None;
         let mut kind = None;
         let mut base = None;
         let mut load_order = None;
@@ -177,6 +181,7 @@ impl Manifest {
                 "id" => id = Some(non_empty_string(item, "id")?),
                 "name" => name = Some(string_value(item, "name")?),
                 "version" => version = Some(string_value(item, "version")?),
+                "description" => description = Some(string_value(item, "description")?),
                 "kind" => {
                     let text = string_value(item, "kind")?;
                     kind = Some(match text.as_str() {
@@ -239,6 +244,7 @@ impl Manifest {
             id,
             name,
             version,
+            description,
             kind,
             base,
             load_order: load_order.unwrap_or(0),
@@ -267,6 +273,9 @@ impl Manifest {
         }
         if let Some(version) = &self.version {
             write_pair(&mut out, "version", &quote(version));
+        }
+        if let Some(description) = &self.description {
+            write_pair(&mut out, "description", &quote(description));
         }
         write_pair(&mut out, "kind", &quote(self.kind.as_str()));
         if let Some(base) = &self.base {
@@ -590,6 +599,7 @@ mod tests {
             id: "re1".to_string(),
             name: Some("Arklay base".to_string()),
             version: Some("0.1.0".to_string()),
+            description: None,
             kind: PackKind::Base,
             base: None,
             load_order: 0,
@@ -609,6 +619,7 @@ mod tests {
             id: "demo".to_string(),
             name: Some("Demo mod".to_string()),
             version: None,
+            description: None,
             kind: PackKind::Mod,
             base: Some("re1".to_string()),
             load_order: 40,
@@ -711,6 +722,7 @@ lua = [\"lua/a.lua\", \"lua/b.lua\"]
             id: "demo".to_string(),
             name: Some("Demo mod".to_string()),
             version: Some("1.2.3".to_string()),
+            description: None,
             kind: PackKind::Mod,
             base: Some("re1".to_string()),
             load_order: -7,

@@ -323,6 +323,49 @@ enum Command {
         verbose: bool,
     },
 
+    /// Convert a Classic REbirth mod (.zip or directory) into a mod .akpak
+    ///
+    /// HD textures, films, rooms, models, sounds, room text and a BioRand
+    /// start inventory are mapped onto the entries they override; the CR
+    /// runtime (DLLs, executables, configuration) and save data are left
+    /// out. Without --out the pack is written to the arklay mods folder.
+    ConvertMod {
+        /// The CR mod: a .zip archive or an extracted directory
+        input: PathBuf,
+
+        /// Output pack path (default: <mods dir>/<id>.akpak)
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+
+        /// Only convert this folder of the input (e.g. re1hd of a multi-game zip)
+        #[arg(long, value_name = "DIR")]
+        root: Option<String>,
+
+        /// Base game pack (default: games/re1.akpak under the data roots)
+        #[arg(long, value_name = "PACK")]
+        base: Option<PathBuf>,
+
+        /// Pack id (default: derived from the mod name)
+        #[arg(long)]
+        id: Option<String>,
+
+        /// Pack display name (default: the CR manifest name or file name)
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Pack version (default: parsed from the description or file name)
+        #[arg(long)]
+        version: Option<String>,
+
+        /// Replace an existing output pack even when it holds another mod
+        #[arg(long)]
+        force: bool,
+
+        /// Number of worker threads (default: one per available CPU)
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u16).range(1..))]
+        jobs: Option<u16>,
+    },
+
     /// Extract every entry of a game pack into a directory
     Extract {
         /// Game pack to read
@@ -727,6 +770,16 @@ fn write_pack_info(pack_path: &Path, pack: &Pack, out: &mut impl Write) -> Resul
             if let Some(version) = &manifest.version {
                 writeln!(out, "  version: {version}")?;
             }
+            if let Some(description) = &manifest.description {
+                for (index, line) in description.lines().enumerate() {
+                    let label = if index == 0 {
+                        "description:"
+                    } else {
+                        "            "
+                    };
+                    writeln!(out, "  {label} {line}")?;
+                }
+            }
             if let Some(engine) = &manifest.engine {
                 writeln!(out, "  engine: {engine}")?;
             }
@@ -776,6 +829,42 @@ fn pack_info(pack_path: &Path, mods: &[PathBuf]) -> Result<()> {
     write_pack_info(pack_path, &pack, &mut out)
 }
 
+/// `convert-mod`: convert and print the summary.
+fn convert_mod(options: arklay::convert_mod::ConvertModOptions) -> Result<()> {
+    let summary = arklay::convert_mod::convert_mod(&options)?;
+    for warning in &summary.warnings {
+        eprintln!("warning: {warning}");
+    }
+    if let Some(manifest) = &summary.manifest {
+        println!(
+            "mod: {} ({}){}",
+            manifest.name.as_deref().unwrap_or(&manifest.id),
+            manifest.id,
+            manifest
+                .version
+                .as_deref()
+                .map(|version| format!(" {version}"))
+                .unwrap_or_default()
+        );
+    }
+    println!(
+        "{} {} ({} entries, {} plain bytes)",
+        if summary.replaced {
+            "replaced"
+        } else {
+            "wrote"
+        },
+        summary.out.display(),
+        summary.entries,
+        summary.bytes
+    );
+    println!(
+        "left out: {} CR runtime/config/save file(s), {} file(s) identical to the base game",
+        summary.skipped, summary.unchanged
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     arklay::logging::init();
     let cli = Cli::parse();
@@ -792,6 +881,27 @@ fn main() -> Result<()> {
             jobs.map_or(0, usize::from),
             verbose,
         ),
+        Some(Command::ConvertMod {
+            input,
+            out,
+            root,
+            base,
+            id,
+            name,
+            version,
+            force,
+            jobs,
+        }) => convert_mod(arklay::convert_mod::ConvertModOptions {
+            input,
+            out,
+            root,
+            base,
+            id,
+            name,
+            version,
+            force,
+            jobs: jobs.map_or(0, usize::from),
+        }),
         Some(Command::Extract { pack, out, mods }) => extract_pack(&pack, &out, &mods),
         Some(Command::Hash { file, class }) => hash_file(&file, class.as_deref()),
         Some(Command::List { pack, mods }) => list_pack(&pack, &mods),
@@ -1462,6 +1572,37 @@ entries:
             cli.command,
             Some(Command::ConvertGame { verbose: false, .. })
         ));
+    }
+
+    #[test]
+    fn convert_mod_parses_its_options() {
+        let cli = Cli::try_parse_from(["arklay", "convert-mod", "mod.zip"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::ConvertMod {
+                out: None,
+                force: false,
+                ..
+            })
+        ));
+
+        let cli = Cli::try_parse_from([
+            "arklay",
+            "convert-mod",
+            "mod.zip",
+            "-o",
+            "out.akpak",
+            "--id",
+            "hd",
+            "--force",
+        ])
+        .unwrap();
+        let Some(Command::ConvertMod { out, id, force, .. }) = cli.command else {
+            panic!("expected convert-mod");
+        };
+        assert_eq!(out.as_deref(), Some(Path::new("out.akpak")));
+        assert_eq!(id.as_deref(), Some("hd"));
+        assert!(force);
     }
 
     #[test]

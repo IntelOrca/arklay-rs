@@ -652,6 +652,8 @@ mod imp {
 
 pub use imp::LuaVm;
 
+#[cfg(test)]
+pub(crate) use imp::run_chunk;
 pub(crate) use imp::{Budget, new_sandboxed_state};
 
 mod scripts {

@@ -80,6 +80,11 @@ cargo run -- convert-game /path/to/re1 --out re1.akpak --jobs 4
 # Japanese sheet
 cargo run -- convert-game /path/to/steam/4249100_Biohazard --out re1.akpak
 
+# Convert a Classic REbirth mod (.zip or directory: HD texture packs, BioRand
+# seeds, ...) into a mod pack in the per-user mods directory; see
+# docs/modding.md for the mapping
+cargo run -- convert-mod RE-ENHANCE_RE1_v2.0_GOG.zip
+
 # List every pack entry with its size, then the entry count and total bytes
 cargo run -- list re1.akpak
 
