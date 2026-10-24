@@ -663,6 +663,11 @@ end
 
 local STATES = { init, run, damaged, death }
 
+-- The Adder's sounds (`enemy/em0a_*`); the second Adder room loads the
+-- `PYe_*` takes (`enemy/em0a_e_*`).
+-- TODO: a per-room hack until room scripts can pick a spawn's sound style.
+sounds = { styles = { [0x30D] = "e" } }
+
 function update(e)
     -- Monsters freeze behind a message: the state machine and the whole
     -- collision pass are inside the gate.

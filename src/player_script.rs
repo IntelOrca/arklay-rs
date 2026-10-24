@@ -416,7 +416,7 @@ fn play_entity_thud(game: &mut GameState, room: &RoomState) {
     };
     let column = crate::sfx::entity_sound_column(room, pos, THUD_TYPE, slow).unwrap_or(0);
     game.entity_sounds.push(EntitySound {
-        name,
+        name: name.into(),
         bank: 2,
         column,
         pos,
@@ -2273,7 +2273,7 @@ fn play_player_sound(game: &mut GameState, room: &RoomState, bank: u8, id: u8) {
     if let Some((name, bank, column)) = crate::sfx::play_3d_cue(room, character, bank, id) {
         let pos = game.entities[0].pos;
         game.entity_sounds.push(EntitySound {
-            name,
+            name: name.into(),
             bank,
             column,
             pos,

@@ -649,7 +649,7 @@ fn projectile(game: &mut GameState, index: usize) {
         && let Some(name) = crate::sfx::weapon_sound(weapon, 10)
     {
         game.entity_sounds.push(crate::game::EntitySound {
-            name,
+            name: name.into(),
             bank: 1,
             column: weapon,
             pos,

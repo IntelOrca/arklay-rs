@@ -9,6 +9,7 @@
 //! in the high byte of its lookup result and a sound offset in the low byte.
 //! The offset plus the entity sound type names the column inside the room row.
 
+use crate::game::SoundName;
 use crate::state::RoomState;
 
 /// Rooms per stage in the room sound table.
@@ -2658,13 +2659,16 @@ pub fn entity_sound_column(
     Some(entity_sound_index(zone as u8, sound_type, slow))
 }
 
-/// One `Snd_em` cue: `(wav name, enemy bank record)`.
+/// One `Snd_em` cue: `(enemy sound, enemy bank record)`.
 ///
 /// The original accepts only the group-relative ids `0..=9`, adds
 /// `group * 10` from the spawn record's sound-group nibble, and drops the cue
 /// when the resulting record reaches the 48-entry bank. An id outside that
-/// range queues nothing.
-pub fn enemy_sound(room: &RoomState, id: u8, group: u8) -> Option<(&'static str, u8)> {
+/// range queues nothing. The record still keys the mixer bank, so same-group
+/// cues restart each other like the original's; the sound itself is the
+/// enemy's own slot `id`, resolved through [`enemy_sound_stems`] when it plays
+/// instead of through the room's table.
+pub fn enemy_sound(entity: u8, id: u8, group: u8) -> Option<(SoundName, u8)> {
     if id >= 10 {
         return None;
     }
@@ -2672,9 +2676,121 @@ pub fn enemy_sound(room: &RoomState, id: u8, group: u8) -> Option<(&'static str,
     if record >= 48 {
         return None;
     }
-    let name = room_sound(room_row(room.stage, room.room), usize::from(record))?;
-    Some((name, record))
+    Some((
+        SoundName::Enemy {
+            id: entity,
+            slot: id,
+        },
+        record,
+    ))
 }
+
+/// The pack directory enemy scripts, models and sounds live in.
+pub const ENEMY_DIR: &str = "enemy";
+
+/// The pack stem an enemy sound set name resolves to: `em00` is
+/// `enemy/em00`, `lib/zombie` is `enemy/lib/zombie` and `/x/y` is `x/y`
+/// from the pack root.
+pub fn enemy_sound_set_stem(set: &str) -> String {
+    match set.strip_prefix('/') {
+        Some(absolute) => absolute.to_string(),
+        None => format!("{ENEMY_DIR}/{set}"),
+    }
+}
+
+/// The pack stems tried, in order, for slot `slot` of the enemy sound sets
+/// `sets` (the enemy's own set first, then each `sounds` base it inherits)
+/// under the optional sound `style`.
+///
+/// Each set contributes `{set}_{style}_{slot:02}` (when a style is active)
+/// and then `{set}_{slot:02}`, so a style only needs to ship the slots it
+/// changes. The first stem the pack carries plays; none means silence.
+pub fn enemy_sound_stems(sets: &[String], style: Option<&str>, slot: u8) -> Vec<String> {
+    let mut stems = Vec::with_capacity(sets.len() * 2);
+    for set in sets {
+        let stem = enemy_sound_set_stem(set);
+        if let Some(style) = style {
+            stems.push(format!("{stem}_{style}_{slot:02}"));
+        }
+        stems.push(format!("{stem}_{slot:02}"));
+    }
+    stems
+}
+
+/// The enemy sound files the converter extracts from the original install:
+/// `(set, [(slot, wav name)])`, packed as `enemy/{set}_{slot:02}.wav`.
+///
+/// Each enemy's default set is the one most of its rooms load in the shipped
+/// per-room table. A `{id}_{style}` set carries only the slots a style
+/// changes; the enemy scripts pick the style (the zombies key it by room, as
+/// the original's tables did). Enemies that share a set reference it from
+/// their script's `sounds` declaration instead of repeating it here.
+#[rustfmt::skip]
+pub static ENEMY_SOUNDS: &[(&str, &[(u8, &str)])] = &[
+    // Standard zombie; the green zombie (em11) inherits it.
+    ("em00", &[(0, "z_taore"), (1, "z_ftL"), (2, "z_ftR"), (3, "z_kamu"), (4, "z_osou"),
+               (5, "z_unaruA"), (6, "z_head"), (7, "z_Hkick"), (8, "z_Ugoron"), (9, "z_unaruB")]),
+    ("em00_aoya", &[(4, "z_aoya02"), (5, "z_aoya01"), (9, "z_aoya03")]),
+    ("em00_isi", &[(4, "z_isi02"), (5, "z_isi01"), (9, "z_isi03")]),
+    ("em00_isi2", &[(4, "z_isi202"), (5, "z_isi201"), (9, "z_isi203")]),
+    ("em00_isi3", &[(4, "z_isi302"), (5, "z_isi301"), (9, "z_isi303")]),
+    ("em00_isi3b", &[(4, "z_isi301"), (5, "z_isi302"), (9, "z_isi303")]),
+    ("em00_k", &[(4, "z_k02"), (5, "z_k01"), (7, "z_haki"), (8, "z_sanj"), (9, "z_k03")]),
+    ("em00_k2", &[(4, "z_k02"), (5, "z_k01"), (9, "z_k03")]),
+    ("em00_mika", &[(4, "z_mika02"), (5, "z_mika01"), (9, "z_mika03")]),
+    ("em00_simo", &[(4, "z_simo02"), (5, "z_simo01"), (9, "z_simo03")]),
+    ("em00_suzu", &[(4, "z_suzu02"), (5, "z_suzu01"), (7, "z_haki"), (8, "z_sanj"),
+                    (9, "z_suzu03")]),
+    ("em00_suzu2", &[(4, "z_suzu02"), (5, "z_suzu01"), (9, "z_suzu03")]),
+    ("em00_tomo", &[(1, "ze_ftL"), (3, "ze_kamu"), (4, "ze_tomo2"), (5, "ze_tomo1"),
+                    (6, "ze_head"), (7, "ze_haki"), (8, "ze_sanj"), (9, "ze_tomo3")]),
+    // Naked zombie.
+    ("em01", &[(0, "z_taore"), (1, "zep_ftL"), (2, "z_ftR"), (3, "ze_kamu"), (4, "z_nisi2"),
+               (5, "z_nisi1"), (6, "ze_head"), (7, "ze_haki"), (8, "ze_sanj"), (9, "z_nisi3")]),
+    // Cerberus.
+    ("em02", &[(0, "cer_foot"), (1, "cer_taoA"), (2, "cer_unar"), (3, "cer_bite"),
+               (4, "cer_cryA"), (5, "cer_taoB"), (6, "cer_jkMX"), (7, "cer_kamu"),
+               (8, "cer_cryB"), (9, "cer_runMX")]),
+    // WebSpinner; the Black Tiger (em04) inherits it.
+    ("em03", &[(0, "kuasi_A"), (1, "kuasi_B"), (2, "kuasi_C"), (3, "sp_rakk"), (4, "sp_atck"),
+               (5, "sp_bomb"), (6, "sp_fumu"), (7, "sp_Doku"), (8, "sp_sanj2")]),
+    ("em04", &[(8, "poison")]),
+    // Crow.
+    ("em05", &[(0, "RVcar1"), (1, "RVpat"), (2, "RVcar2"), (3, "RVwing1"), (4, "RVwing2"),
+               (5, "RVfryed")]),
+    // Hunter.
+    ("em06", &[(0, "HU_walkA"), (1, "HU_walkB"), (2, "HU_jump"), (3, "HU_att"), (4, "HU_land"),
+               (5, "HU_smash"), (6, "HU_dam"), (7, "HU_Nout")]),
+    ("em06_he", &[(0, "He_walkA"), (1, "He_walkB"), (2, "He_jump"), (3, "He_att"),
+                  (4, "He_land"), (5, "He_smash"), (6, "He_dam"), (7, "He_Nout")]),
+    // Wasp.
+    ("em07", &[(0, "bee4_ed"), (1, "hatinage"), (2, "bee_fumu")]),
+    // Plant 42.
+    ("em08", &[(0, "VN_air"), (1, "VN_kazeA"), (2, "VN_hitA"), (3, "VN_kazeB"), (4, "VN_hitL"),
+               (5, "VN_hitB"), (6, "VN_sime"), (7, "VN_OUT"), (8, "VN_fall"), (9, "VN_OUT2")]),
+    // Chimera.
+    ("em09", &[(0, "FL_walk"), (1, "FL_jump"), (2, "steam_b"), (3, "FL_ceil"), (4, "FL_fall"),
+               (5, "FL_slash"), (6, "FL_att"), (7, "FL_dam"), (8, "FL_out")]),
+    // Adder.
+    ("em0a", &[(0, "PY_mena"), (1, "PY_hit2"), (2, "PY_fall")]),
+    ("em0a_e", &[(0, "PYe_mena"), (1, "PYe_hit"), (2, "PYe_fall")]),
+    // Neptune.
+    ("em0b", &[(0, "nep_attB"), (1, "nep_attA"), (2, "nep_nomu"), (3, "nep_tura"),
+               (4, "nep_twis"), (5, "nep_jump")]),
+    // Tyrant (the lab encounter).
+    ("em0c", &[(0, "TY_foot"), (1, "TY_kaze"), (2, "TY_slice"), (3, "TY_HIT"), (4, "TY_trust"),
+               (6, "TY_taore"), (7, "TY_nage")]),
+    // Yawn; the rematch (em12) inherits it.
+    ("em0d", &[(0, "GV_move"), (1, "GV_dino"), (2, "GV_p_at"), (3, "GV_swing"), (4, "GV_bite"),
+               (5, "GV_blood"), (6, "GV_gulpA"), (7, "GV_gulpB")]),
+    // Monster plant.
+    ("em0f", &[(0, "VN_whip"), (1, "VN_hitA"), (2, "VN_hitB"), (3, "VN_sime"), (4, "VN_OUT")]),
+    ("em0f_kaze", &[(0, "VN_kazea")]),
+    // Tyrant (the heliport encounter): its own full set, since its slots 5
+    // and 6 differ from the lab Tyrant's in which one is empty.
+    ("em10", &[(0, "TY_foot"), (1, "TY_kaze"), (2, "TY_slice"), (3, "TY_HIT"), (4, "TY_trust"),
+               (5, "TY_slef"), (7, "TY_nage")]),
+];
 
 /// The weapon bank's per-weapon sound sub-tables, one row per shipped bank id.
 ///
@@ -3205,25 +3321,57 @@ mod tests {
 
     #[test]
     fn enemy_sound_offsets_the_group_and_bounds_the_bank() {
-        // Plant 42's roots room (stage 4, room 0x0F, table row 102) names the
-        // enemy columns the roots machine uses.
-        let room = RoomState {
-            stage: 4,
-            room: 0x0F,
-            ..RoomState::default()
-        };
+        let cue = |slot| SoundName::Enemy { id: 0x0E, slot };
         // The pre-group id is bounded 0..=9; the roots cycle-start cue 0x18
         // is out of range and queues nothing.
-        assert_eq!(enemy_sound(&room, 0x18, 0), None);
-        assert_eq!(enemy_sound(&room, 10, 0), None);
-        // The group nibble shifts the record by ten per step.
-        assert_eq!(enemy_sound(&room, 4, 2), Some(("pakiA", 24)));
-        assert_eq!(enemy_sound(&room, 5, 2), Some(("pakiB", 25)));
-        assert_eq!(enemy_sound(&room, 5, 4), Some(("ft_concA", 45)));
-        // Past the 48-record bank, and a row with no name, drop.
-        assert_eq!(enemy_sound(&room, 8, 4), None);
-        assert_eq!(enemy_sound(&room, 9, 7), None);
-        assert_eq!(enemy_sound(&room, 3, 0), None);
+        assert_eq!(enemy_sound(0x0E, 0x18, 0), None);
+        assert_eq!(enemy_sound(0x0E, 10, 0), None);
+        // The group nibble shifts the bank record by ten per step; the sound
+        // stays the enemy's own slot.
+        assert_eq!(enemy_sound(0x0E, 4, 2), Some((cue(4), 24)));
+        assert_eq!(enemy_sound(0x0E, 5, 4), Some((cue(5), 45)));
+        assert_eq!(enemy_sound(0x0E, 3, 0), Some((cue(3), 3)));
+        // Past the 48-record bank drops.
+        assert_eq!(enemy_sound(0x0E, 8, 4), None);
+        assert_eq!(enemy_sound(0x0E, 9, 7), None);
+    }
+
+    #[test]
+    fn enemy_sound_stems_try_the_style_then_each_inherited_set() {
+        let sets = ["em11".to_string(), "em00".to_string()];
+        assert_eq!(
+            enemy_sound_stems(&sets, Some("isi"), 4),
+            [
+                "enemy/em11_isi_04",
+                "enemy/em11_04",
+                "enemy/em00_isi_04",
+                "enemy/em00_04"
+            ]
+        );
+        assert_eq!(
+            enemy_sound_stems(&["lib/zombie".to_string(), "/x/y".to_string()], None, 12),
+            ["enemy/lib/zombie_12", "x/y_12"]
+        );
+    }
+
+    #[test]
+    fn enemy_sound_sets_name_installed_sounds_once() {
+        let installed: std::collections::HashSet<String> = SE_NAMES
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        for (set, slots) in ENEMY_SOUNDS {
+            assert!(seen.insert(*set), "{set} is listed twice");
+            assert!(slots.windows(2).all(|pair| pair[0].0 < pair[1].0), "{set}");
+            for (slot, name) in *slots {
+                assert!(*slot < 10, "{set} slot {slot}");
+                assert!(
+                    installed.contains(&name.to_ascii_lowercase()),
+                    "{set} slot {slot}: {name} is not in SE_NAMES"
+                );
+            }
+        }
     }
 
     #[test]

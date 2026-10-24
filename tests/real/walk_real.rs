@@ -270,13 +270,13 @@ fn real_room5000_footstep_plays_on_the_contact_frame() {
         entity.animation_frame_id
     );
     let variant = if sound_type == 0 { "A" } else { "B" };
+    let name = sound.name.room().expect("a footstep names a room sound");
     assert!(
-        sound.name.ends_with(variant),
-        "{} is not the {variant} footstep of clip {}",
-        sound.name,
+        name.ends_with(variant),
+        "{name} is not the {variant} footstep of clip {}",
         entity.animation_id
     );
-    assert_real_footstep(&pack, sound.name);
+    assert_real_footstep(&pack, name);
     assert_eq!(sound.pos, entity.pos, "the cue carries the entity position");
 }
 

@@ -324,7 +324,7 @@ fn handgun_fire_queues_weapon_bank_sounds_that_are_packed() {
         queued.extend(
             run.game.entity_sounds[before..]
                 .iter()
-                .map(|sound| sound.name),
+                .filter_map(|sound| sound.name.room()),
         );
     }
 

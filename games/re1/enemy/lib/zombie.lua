@@ -54,6 +54,23 @@
 
 local M = {}
 
+-- The groan style each room plays (`enemy/em00_{style}_*`), keyed by
+-- `stage << 8 | room`: the shipped per-room tables give the zombies of most
+-- rooms their own groans (slots 4, 5 and 9, some also 7 and 8). A room not
+-- listed plays the default set. Shared by the standard and green zombies.
+-- TODO: a per-room hack until room scripts can pick a spawn's sound style.
+M.SOUND_STYLES = {
+    [0x101] = "k", [0x10B] = "k", [0x20E] = "k", [0x71B] = "k2",
+    [0x107] = "aoya", [0x112] = "aoya", [0x407] = "aoya", [0x40B] = "aoya",
+    [0x111] = "simo", [0x401] = "simo", [0x611] = "simo",
+    [0x103] = "isi", [0x614] = "isi", [0x71C] = "isi",
+    [0x10A] = "isi2",
+    [0x204] = "isi3", [0x208] = "isi3", [0x714] = "isi3b",
+    [0x104] = "mika", [0x105] = "mika",
+    [0x201] = "suzu", [0x207] = "suzu", [0x71A] = "suzu2",
+    [0x503] = "tomo", [0x50C] = "tomo",
+}
+
 -- ---------------------------------------------------------------------------
 -- Constants
 -- ---------------------------------------------------------------------------

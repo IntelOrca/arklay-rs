@@ -686,7 +686,7 @@ fn play_weapon_sound(game: &mut GameState, weapon: u8, id: u8) {
         return;
     };
     game.entity_sounds.push(EntitySound {
-        name,
+        name: name.into(),
         bank: 1,
         column: weapon,
         pos: game.entities[0].pos,
@@ -2113,7 +2113,7 @@ pub fn update_detached_clip(game: &mut GameState, player: &mut PlayerState, room
                     crate::sfx::play_3d_cue(room, game.id.player_flag, 2, 0x15)
                 {
                     game.entity_sounds.push(EntitySound {
-                        name,
+                        name: name.into(),
                         bank,
                         column,
                         pos,

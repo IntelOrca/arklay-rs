@@ -871,9 +871,9 @@ fn spawn_player_billboard(
 }
 
 /// Queue the enemy-bank cue `id` at `slot`'s position (the monster `Snd_em`).
-fn queue_enemy_cue(game: &mut GameState, room: &RoomState, slot: usize, id: u8) {
+fn queue_enemy_cue(game: &mut GameState, slot: usize, id: u8) {
     let group = (game.entities[slot].variant >> 4) & 0x7;
-    if let Some((name, column)) = crate::sfx::enemy_sound(room, id, group) {
+    if let Some((name, column)) = crate::sfx::enemy_sound(game.entities[slot].id, id, group) {
         let pos = game.entities[slot].pos;
         game.entity_sounds.push(crate::game::EntitySound {
             name,
@@ -1029,7 +1029,6 @@ impl GameState {
         self.entities[slot].hit_state = hit_state;
 
         self.apply_post_hit(
-            room,
             slot,
             weapon_adj,
             weapon_id,
@@ -1057,7 +1056,6 @@ impl GameState {
     #[allow(clippy::too_many_arguments)]
     fn apply_post_hit(
         &mut self,
-        room: &RoomState,
         slot: usize,
         weapon_adj: u8,
         weapon_id: u8,
@@ -1081,7 +1079,6 @@ impl GameState {
                     spawn_player_billboard(self, record.effect_type, record.effect_data, offset, 0);
                 }
                 self.dispatch_reaction(
-                    room,
                     slot,
                     record,
                     displacement,
@@ -1093,7 +1090,6 @@ impl GameState {
             }
             Some(PostHit::Reaction) => {
                 self.dispatch_reaction(
-                    room,
                     slot,
                     record,
                     displacement,
@@ -1109,7 +1105,6 @@ impl GameState {
                     self.entities[slot].hit_state = self.entities[slot].hit_state.wrapping_sub(1);
                 }
                 self.dispatch_reaction(
-                    room,
                     slot,
                     record,
                     displacement,
@@ -1122,7 +1117,6 @@ impl GameState {
             Some(PostHit::Blood) => {
                 self.blood_fx(slot, record, aim_flags, yaw);
                 self.dispatch_reaction(
-                    room,
                     slot,
                     record,
                     displacement,
@@ -1135,7 +1129,6 @@ impl GameState {
             Some(PostHit::Blood2) => {
                 self.blood2_fx(slot, record, aim_flags, yaw);
                 self.dispatch_reaction(
-                    room,
                     slot,
                     record,
                     displacement,
@@ -1148,7 +1141,6 @@ impl GameState {
             Some(PostHit::Sparks) => {
                 self.sparks_fx(slot, record, aim_flags, yaw);
                 self.dispatch_reaction(
-                    room,
                     slot,
                     record,
                     displacement,
@@ -1162,7 +1154,6 @@ impl GameState {
                 self.blood3_fx(slot, record, aim_flags, yaw);
                 self.blood2_fx(slot, record, aim_flags, yaw);
                 self.dispatch_reaction(
-                    room,
                     slot,
                     record,
                     displacement,
@@ -1181,7 +1172,6 @@ impl GameState {
     #[allow(clippy::too_many_arguments)]
     fn dispatch_reaction(
         &mut self,
-        room: &RoomState,
         slot: usize,
         record: HitRecordFirst,
         displacement: u32,
@@ -1234,7 +1224,7 @@ impl GameState {
                 }
             }
             HitReaction::Zombie => {
-                self.zombie_reaction(room, slot, record, displacement, weapon_adj, aim_flags, yaw);
+                self.zombie_reaction(slot, record, displacement, weapon_adj, aim_flags, yaw);
             }
         }
     }
@@ -1246,7 +1236,6 @@ impl GameState {
     #[allow(clippy::too_many_arguments)]
     fn zombie_reaction(
         &mut self,
-        room: &RoomState,
         slot: usize,
         record: HitRecordFirst,
         displacement: u32,
@@ -1269,7 +1258,7 @@ impl GameState {
                     let bit = self.entities[slot].death_event_id;
                     self.flags[usize::from(BANK_ENEMIES)].apply(bit, 0);
                 }
-                queue_enemy_cue(self, room, slot, 6);
+                queue_enemy_cue(self, slot, 6);
                 // `joint_setup_attack_effect(head, 30, 2, 3)`: clear the head
                 // joint's active bit and set `0x28`, the gore state the
                 // death/get-up paths read (`& 0xCC`, `& 0x40`).

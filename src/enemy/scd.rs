@@ -854,7 +854,7 @@ fn fire_flame_step(game: &mut GameState, slot: usize, room: &RoomState, clips: &
         for id in [0x1E, 0x1F] {
             if let Some((name, bank, column)) = crate::sfx::play_3d_cue(room, 0, 2, id) {
                 game.entity_sounds.push(EntitySound {
-                    name,
+                    name: name.into(),
                     bank,
                     column,
                     pos,

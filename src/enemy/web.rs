@@ -68,9 +68,9 @@ fn clone_distance(entity: &Entity, player_pos: [i32; 3]) -> i32 {
 /// Queue the clone's enemy-bank cue at the clone's own position (the original
 /// walks the clone through the global entity pointer, so `Snd_em` uses the
 /// clone's inherited variant and position).
-fn play_clone_sound(game: &mut GameState, room: &RoomState, clone: &Entity, id: u8) {
+fn play_clone_sound(game: &mut GameState, clone: &Entity, id: u8) {
     let group = (clone.variant >> 4) & 0x7;
-    if let Some((name, column)) = crate::sfx::enemy_sound(room, id, group) {
+    if let Some((name, column)) = crate::sfx::enemy_sound(clone.id, id, group) {
         game.entity_sounds.push(EntitySound {
             name,
             bank: 2,
@@ -220,7 +220,7 @@ pub fn update(game: &mut GameState, room: &RoomState, parent: usize, count: u8) 
                     0,
                 );
                 if entity.reaction_timer == 0 {
-                    play_clone_sound(game, room, &entity, 6);
+                    play_clone_sound(game, &entity, 6);
                     entity.reaction_timer = -0x2D;
                 }
                 entity.set_state(6);

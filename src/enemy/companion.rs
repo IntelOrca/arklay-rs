@@ -185,9 +185,9 @@ fn pulse(counter: i16) -> u8 {
 
 /// Queue the companion's enemy-bank cue at its own position (the clone kept
 /// the plant's spawn-record variant, which carries the sound group).
-fn play_companion_sound(game: &mut GameState, room: &RoomState, companion: &Companion, id: u8) {
+fn play_companion_sound(game: &mut GameState, companion: &Companion, id: u8) {
     let group = (companion.entity.variant >> 4) & 0x7;
-    if let Some((name, column)) = crate::sfx::enemy_sound(room, id, group) {
+    if let Some((name, column)) = crate::sfx::enemy_sound(companion.entity.id, id, group) {
         game.entity_sounds.push(EntitySound {
             name,
             bank: 2,
@@ -202,7 +202,7 @@ fn play_companion_3d(game: &mut GameState, room: &RoomState, companion: &Compani
     let character = game.id.player_flag;
     if let Some((name, bank, column)) = crate::sfx::play_3d_cue(room, character, 2, id) {
         game.entity_sounds.push(EntitySound {
-            name,
+            name: name.into(),
             bank,
             column,
             pos: companion.entity.pos,
@@ -362,11 +362,11 @@ const DEAD_X: i32 = 0;
 
 /// The flower body's idle: pulse the scale, cue the breathing sound on the
 /// `0x41` frame, integrate the two sway oscillators and count the timer down.
-fn body_idle(game: &mut GameState, room: &RoomState, companion: &mut Companion) {
+fn body_idle(game: &mut GameState, companion: &mut Companion) {
     let scale = i32::from(pulse(companion.timer)) * 3 + 0x1000;
     companion.scale = [scale, scale, scale];
     if companion.timer == 0x41 {
-        play_companion_sound(game, room, companion, 0);
+        play_companion_sound(game, companion, 0);
     }
     let t = companion.timer;
     companion.timer = t.wrapping_sub(1);
@@ -610,7 +610,7 @@ pub fn plant42_tick(game: &mut GameState, room: &RoomState, slot: usize) {
         if !paused {
             match companion.kind {
                 CompanionKind::Body => match companion.state {
-                    0 => body_idle(game, room, &mut companion),
+                    0 => body_idle(game, &mut companion),
                     1 | 3 => body_shrivel(game, &mut companion, handle),
                     2 => body_fall(game, room, &mut companion, handle),
                     _ => {}

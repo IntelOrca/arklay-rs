@@ -10,6 +10,9 @@ local VARIANT = {
     radius = 422,
 }
 
+-- The standard zombie's sounds (`enemy/em00_*`), with the room's groan style.
+sounds = { styles = zombie.SOUND_STYLES }
+
 function update(e)
     zombie.run(e, VARIANT)
 end
