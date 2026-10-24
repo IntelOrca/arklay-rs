@@ -2250,6 +2250,7 @@ mod tests {
             id: id.to_string(),
             name: None,
             version: None,
+            description: None,
             kind: manifest::PackKind::Mod,
             base: Some(base.to_string()),
             load_order,

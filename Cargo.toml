@@ -45,6 +45,7 @@ symphonia-codec-aac = { version = "0.6", optional = true }
 symphonia-core = { version = "0.6", default-features = false, optional = true }
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
 zstd = "0.13"
+zip = { version = "9.1.0", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
 sdl3-sys = { version = "0.7", default-features = false, features = ["build-from-source-static"] }

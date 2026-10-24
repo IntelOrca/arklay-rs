@@ -15,6 +15,7 @@ pub mod combat;
 pub mod config;
 pub mod controls;
 pub mod convert;
+pub mod convert_mod;
 pub mod demo;
 pub mod door;
 pub mod effects;

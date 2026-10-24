@@ -59,6 +59,7 @@ fn main() {
 
     emit_scripts("enemy", "ENEMY_SCRIPTS", "enemy_scripts.rs");
     emit_scripts("ui", "UI_SCRIPTS", "ui_scripts.rs");
+    emit_scripts("game", "GAME_SCRIPTS", "game_scripts.rs");
     emit_language_files();
 }
 

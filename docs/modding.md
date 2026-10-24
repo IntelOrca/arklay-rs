@@ -19,6 +19,7 @@ format = 1
 id = "demo"
 name = "Demo mod"
 version = "0.1.0"
+description = "One line or several.\nShown by `arklay pack info`."
 kind = "mod"
 base = "re1"
 load_order = 10
@@ -33,6 +34,7 @@ lua = ["lua/demo.lua"]
 | `format` | Manifest format; `1` today. Required. |
 | `id` | Stable pack id. Required. |
 | `name`, `version` | Human-facing labels. Optional. |
+| `description` | Longer human-facing text (credits, a seed); `\n` breaks lines. Optional. |
 | `kind` | `"base"` or `"mod"`. Required. |
 | `base` | A mod's base pack id. Required for mods. |
 | `load_order` | Layer order; lower applies first. Default 0. |
@@ -380,6 +382,82 @@ The checked-in `mods/hd/` is the replacement-format reference: a 2x PNG room
 background, a UI page shipped as both PNG and WebP, and an OGG Vorbis BGM
 track, with no game assets either.
 
+## The new-game start inventory
+
+The items a new game starts with come from the Lua chunk `game/new_game.lua`,
+not from the engine. The base pack carries the shipped one
+(`games/re1/game/new_game.lua`); a mod replaces the start items by shipping its
+own entry at the same path. The chunk runs once per new game, after the
+`bio_card.dat` copy, as `local api, character = ...` with `character` `0` for
+Chris and `1` for Jill. The player's inventory is already empty when it runs
+(for Jill the two partner slots her eight-slot run overlaps are cleared too),
+so it only needs `api:set_item_slot` and `api:set_partner_slot`:
+
+```lua
+local api, character = ...
+if character == 0 then
+    api:set_item_slot(0, 0x01, 0)        -- knife
+    api:set_item_slot(1, 0x02, 15)       -- beretta
+    api:set_partner_slot(0, 0x41, 1)     -- Rebecca's first aid spray
+else
+    api:set_item_slot(0, 0x01, 0)
+end
+```
+
+A chunk that fails to load or errors is logged and the shipped items are used
+instead, so a broken mod never starts the player empty-handed.
+
+## Converting Classic REbirth mods
+
+`arklay convert-mod <mod>` turns a Classic REbirth (CR) mod, a `.zip` or an
+extracted directory, into a mod pack. A CR mod is the game's own files with
+overrides, so each file is mapped by the folder it sits in onto the entry
+`convert-game` gives the file it replaces:
+
+| CR file | Pack entry |
+| --- | --- |
+| `hires/**` (HD backgrounds, masks, skins, `cache/ROOM####.dat`) | `htexture/**` |
+| `movie/*.mp4`, `movie/*.avi` | `movie/<film>.<ext>`; an AVI beside an MP4 of the same film is dropped |
+| `STAGEn/ROOM####.RDT` | `room/####.rdt` |
+| `STAGEn/RC*.pak`, `objspr/OSP*.pak` | `roomcut/*.bmp`, `roommask/*.bmp` (copied to stages 6/7 where the room exists) |
+| `ENEMY/*.EMD`, `PLAYERS/*.EMW`, `PLAYERS/*.TMD` | `enemy/*`, `player/*` |
+| `sound/*.WAV`, `voice/*.WAV` | `bgm/*`, `se/*`, every `voice/*` record playing the file |
+| `DATA/*` (UI art, item icons, `BIO_CARD.DAT`, demos, effects) | `ui/*`, `item/*`, `data/*`, `demo/*`, `shadow/*` |
+| `ITEM_M1/*.DOR`, `effspr/*.TIM` | `door/*`, `effspr/*` |
+| `TEXT/ROOM_###.xml` | `ROOM_###_TEXT_##` keys in `language/en-US.txt` |
+| BioRand `init.xml` | `game/new_game.lua` (the start inventory above) |
+| BioRand `type.png` | `ui/type00.png` |
+
+A folder holding a CR `manifest.txt` with a `[MOD]` section is a mod folder:
+its paths are relative to the data root, its files win over the game-root
+overlay, its `Name` becomes the pack name and its `description.txt` the
+manifest `description`. Without one the name comes from the input file name.
+The id is the name lowered to `a-z0-9-` and the version is the first dotted
+number in the description or the file name; `--id`, `--name` and `--version`
+override them.
+
+Left out: the CR runtime and its configuration (`.dll`, `.exe`, `.asi`, `.ini`,
+`.conf`, `.cfg`, `.txt`, logs), `savedata/`, the Director's Cut `_bio1dc/`
+textures, BioRand's `biorand.dat`, and every converted file identical to the
+base pack's entry. Files the engine cannot use yet (BioRand's `bgm_tbl.xml` and
+room sound `tables/`) and files no entry reads are listed as warnings.
+
+The base pack (`--base`, else `games/re1.akpak` under the data roots) decides
+the stage 6/7 copies and the unchanged-file pruning; without one both are
+skipped with a warning. `--root <dir>` converts one folder of an archive that
+bundles several games.
+
+Without `--out` the pack is written to the per-user mods directory as
+`<id>.akpak`, where launches discover it. An existing pack there is replaced
+only when it holds the same mod id (a re-conversion, such as a new BioRand
+seed); `--force` replaces any file.
+
+```sh
+arklay convert-mod RE-ENHANCE_RE1_v2.0_GOG.zip
+arklay convert-mod path/to/biorand/mod_biorand --out biorand.akpak
+arklay convert-mod re-hd.zip --root re1hd --base re1.akpak
+```
+
 ## The `.s` script assembler
 
 `arklay scd export ROOM1000.RDT --out 1000.s` writes the lossless
@@ -458,6 +536,7 @@ exist (Lua colon syntax):
 | `api:give_item(item[, quantity])` | Add items through the normal merge rules (default one). |
 | `api:item_remove(item)` | Clear the whole inventory slot holding the item. |
 | `api:set_item_slot(slot, id[, quantity])` | Replace a player slot's stack; past the held run it appends, id `0` drops it. |
+| `api:set_partner_slot(slot, id[, quantity])` | Replace one of Rebecca's six partner slots; id `0` empties it. |
 | `api:clear_inventory()` | Empty the inventory and clear the equipped/selected item. |
 | `api:set_equipped(id)` | Equip an item (or `nil`/`0` to unequip); derives the weapon id. |
 | `api:set_equipped_weapon(id)` | Set the weapon id the firing model uses, without touching the equipped item. |

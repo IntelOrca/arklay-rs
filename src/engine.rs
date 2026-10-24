@@ -1962,6 +1962,7 @@ pub const NEW_GAME_ROOM_ITEMS: [u8; 32] = [
 /// Item id of the combat knife.
 const ITEM_KNIFE: u8 = 0x01;
 /// Item id of the Beretta (Jill's starting handgun).
+#[cfg(test)]
 const ITEM_BERETTA: u8 = 0x02;
 /// Item id of the first-aid spray.
 const ITEM_FIRST_AID_SPRAY: u8 = 0x41;
@@ -6378,23 +6379,14 @@ fn seed_new_game(pack: &Pack, game: &mut game::GameState, character: u8) {
     // eight for Jill) and clears the rest. The port keeps the player's slots
     // in `inventory` and the contiguous block's last six in
     // `rebecca_inventory`; Jill's two extra slots overlap Rebecca's first two.
+    // The items themselves come from the pack's `game/new_game.lua`.
     game.inventory.clear();
-    game.add_item(ITEM_KNIFE, 0);
+    game.rebuild_slots();
     if character == 1 {
-        game.add_item(ITEM_BERETTA, 15);
-    }
-    game.add_item(ITEM_FIRST_AID_SPRAY, 1);
-    if character == 0 {
-        // Chris's run is six slots, so Rebecca's card beretta survives.
-        game.rebecca_inventory[0] = game::InventoryItem {
-            id: ITEM_BERETTA,
-            quantity: 15,
-        };
-    } else {
-        // Jill's eight-slot run clears Rebecca's first two slots.
         let overlap = game::INVENTORY_SLOTS_JILL - game::INVENTORY_SLOTS_CHRIS;
         game.rebecca_inventory[..overlap].fill(game::InventoryItem::default());
     }
+    crate::lua::seed_new_game_inventory(pack, game, character);
     // `InitializeGame`'s Jill block: the first playthrough raises the main
     // hall's ink-ribbon room-items bit and the Jill first-run scenario bit.
     let second_playthrough = game.flag_test(
@@ -17814,6 +17806,11 @@ mod tests {
     /// and the shipped-style bio card. Title and select art are intentionally
     /// absent: the screens log and continue.
     fn new_game_pack(dir: &TempDir) -> PathBuf {
+        new_game_pack_with(dir, &[])
+    }
+
+    /// [`new_game_pack`] plus `extra` `(entry, bytes)` pairs.
+    fn new_game_pack_with(dir: &TempDir, extra: &[(&str, &[u8])]) -> PathBuf {
         let pack_path = dir.0.join("game.akpak");
         let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
         let mut writer = PackWriter::new();
@@ -17841,6 +17838,9 @@ mod tests {
         writer
             .add(save::SAVE_PREFIX_ENTRY, synthetic_bio_card())
             .unwrap();
+        for (entry, bytes) in extra {
+            writer.add(entry, bytes.to_vec()).unwrap();
+        }
         writer.write(&pack_path).unwrap();
         pack_path
     }
@@ -24595,6 +24595,63 @@ off_0010:
             }
             assert_eq!(session.game.item_count(ITEM_FIRST_AID_SPRAY), 1);
         }
+    }
+
+    /// A pack's `game/new_game.lua` replaces the start items: player slots
+    /// and Rebecca's slots, per character.
+    #[test]
+    fn new_game_script_overrides_the_start_inventory() {
+        let dir = TempDir::new();
+        let script = b"local api, character = ...\n\
+            if character == 0 then\n\
+              api:set_item_slot(0, 3, 7)\n\
+              api:set_partner_slot(0, 0)\n\
+              api:set_partner_slot(5, 11, 30)\n\
+            else\n\
+              api:set_item_slot(0, 5, 6)\n\
+              api:set_item_slot(1, 14, 2)\n\
+            end\n";
+        let pack = Pack::open(&new_game_pack_with(
+            &dir,
+            &[(crate::lua::NEW_GAME_ENTRY, script)],
+        ))
+        .unwrap();
+
+        let chris = GameSession::new(&pack, 0, Path::new("saves")).unwrap();
+        let held: Vec<(u8, u8)> = chris
+            .game
+            .inventory
+            .iter()
+            .map(|slot| (slot.id, slot.quantity))
+            .collect();
+        assert_eq!(held, [(3, 7)]);
+        assert_eq!(chris.game.rebecca_inventory[0].id, 0);
+        assert_eq!(chris.game.rebecca_inventory[5].id, 11);
+        assert_eq!(chris.game.rebecca_inventory[5].quantity, 30);
+
+        let jill = GameSession::new(&pack, 1, Path::new("saves")).unwrap();
+        let held: Vec<(u8, u8)> = jill
+            .game
+            .inventory
+            .iter()
+            .map(|slot| (slot.id, slot.quantity))
+            .collect();
+        assert_eq!(held, [(5, 6), (14, 2)]);
+    }
+
+    /// A failing `game/new_game.lua` falls back to the shipped start items.
+    #[test]
+    fn a_failing_new_game_script_keeps_the_shipped_items() {
+        let dir = TempDir::new();
+        let script = b"local api = ...\napi:set_item_slot(0, 3, 7)\nerror('boom')\n";
+        let pack = Pack::open(&new_game_pack_with(
+            &dir,
+            &[(crate::lua::NEW_GAME_ENTRY, script)],
+        ))
+        .unwrap();
+        let session = GameSession::new(&pack, 1, Path::new("saves")).unwrap();
+        let ids: Vec<u8> = session.game.inventory.iter().map(|slot| slot.id).collect();
+        assert_eq!(ids, [ITEM_KNIFE, ITEM_BERETTA, ITEM_FIRST_AID_SPRAY]);
     }
 
     /// A directly booted room starts with the same playable health block a new

@@ -67,7 +67,7 @@ const PRECOMPRESSED_EXTENSIONS: &[&str] = &["avi", "mp4", "ogg", "png", "webp"];
 
 /// Whether an entry's format already carries its own compression, in which
 /// case `convert-game` stores it raw instead of zstd-compressing it.
-fn is_precompressed(entry: &str) -> bool {
+pub(crate) fn is_precompressed(entry: &str) -> bool {
     Path::new(entry).extension().is_some_and(|extension| {
         PRECOMPRESSED_EXTENSIONS
             .iter()
@@ -518,6 +518,12 @@ pub fn convert_game_observed(
     )?;
     let (uilua_count, uilua_bytes) =
         copy_scripts("uilua", crate::ui::UI_SCRIPTS, &mut writer, &mut progress)?;
+    let (gamelua_count, gamelua_bytes) = copy_scripts(
+        "gamelua",
+        crate::lua::GAME_SCRIPTS,
+        &mut writer,
+        &mut progress,
+    )?;
     let (effect_count, effect_bytes) =
         copy_effect_sheets(&effects, &mut writer, &mut progress, jobs)?;
     let (font_count, font_bytes) = copy_font(&fonts, &mut writer, &mut progress)?;
@@ -650,6 +656,10 @@ pub fn convert_game_observed(
         writeln!(report, "uilua: {uilua_count} entries, {uilua_bytes} bytes")?;
         writeln!(
             report,
+            "gamelua: {gamelua_count} entries, {gamelua_bytes} bytes"
+        )?;
+        writeln!(
+            report,
             "effspr: {effect_count} entries, {effect_bytes} bytes"
         )?;
         writeln!(report, "font: {font_count} entries, {font_bytes} bytes")?;
@@ -705,10 +715,14 @@ pub fn convert_game_observed(
 
 /// Decode one `RC*.pak` camera background into BMP bytes.
 fn convert_camera(pak: &Path) -> Result<Vec<u8>> {
-    let source = file_name(pak);
     let compressed = fs::read(pak).with_context(|| format!("failed to read {}", pak.display()))?;
+    camera_bmp(&file_name(pak), &compressed)
+}
+
+/// Decode one `RC*.pak` camera background (`source` names it in errors).
+pub(crate) fn camera_bmp(source: &str, compressed: &[u8]) -> Result<Vec<u8>> {
     let decoded =
-        lzw::decode(&compressed).with_context(|| format!("failed to LZW-decode {source}"))?;
+        lzw::decode(compressed).with_context(|| format!("failed to LZW-decode {source}"))?;
     let image =
         tim::decode(&decoded).with_context(|| format!("failed to decode {source} as TIM"))?;
     // The retail data contains one 316x236 background (the screen-border
@@ -733,9 +747,13 @@ fn convert_camera(pak: &Path) -> Result<Vec<u8>> {
 
 /// Decode one `OSP*.pak` room mask page into BMP bytes.
 fn convert_roommask(pak: &Path) -> Result<Vec<u8>> {
-    let source = file_name(pak);
     let compressed = fs::read(pak).with_context(|| format!("failed to read {}", pak.display()))?;
-    let decoded = lzw::decode(&compressed)
+    roommask_bmp(&file_name(pak), &compressed)
+}
+
+/// Decode one `OSP*.pak` room mask page (`source` names it in errors).
+pub(crate) fn roommask_bmp(source: &str, compressed: &[u8]) -> Result<Vec<u8>> {
+    let decoded = lzw::decode(compressed)
         .with_context(|| format!("failed to LZW-decode room mask {source}"))?;
     let texture = tim::decode_8bpp(&decoded)
         .with_context(|| format!("failed to decode room mask {source} as an 8bpp TIM"))?;
@@ -913,7 +931,7 @@ fn copy_weapon_assets(
 ///
 /// The room→sheet map references 31 of them; `esp221` and `esp224` ship
 /// unreferenced and are packed anyway.
-const EFFECT_SHEET_FILES: [&str; 33] = [
+pub(crate) const EFFECT_SHEET_FILES: [&str; 33] = [
     "esp000", "esp001", "esp200", "esp201", "esp202", "esp203", "esp204", "esp205", "esp206",
     "esp207", "esp208", "esp209", "esp210", "esp211", "esp212", "esp213", "esp214", "esp215",
     "esp216", "esp217", "esp218", "esp219", "esp220", "esp221", "esp222", "esp223", "esp224",
@@ -1195,7 +1213,7 @@ fn copy_shadow(
 }
 
 /// Convert one UI asset to its pack bytes.
-fn convert_ui_asset(kind: UiKind, raw: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn convert_ui_asset(kind: UiKind, raw: &[u8]) -> Result<Vec<u8>> {
     match kind {
         UiKind::Raw => Ok(raw.to_vec()),
         UiKind::Tim16 => {
@@ -1250,7 +1268,7 @@ fn expand_rgb555(value: u16) -> [u8; 4] {
 /// `pix` is `rows` rows of 40x30 8bpp indices; the palette is `STATUS.TIM`'s
 /// second CLUT row. Index 0 is forced to black so the runtime's mask decode
 /// treats it as transparent.
-fn bake_item_atlas(pix: &[u8], rows: usize, palette: &Texture8) -> Result<Vec<u8>> {
+pub(crate) fn bake_item_atlas(pix: &[u8], rows: usize, palette: &Texture8) -> Result<Vec<u8>> {
     let need = rows
         .checked_mul(items::ICON_ROW_BYTES)
         .context("item sheet is too large")?;
@@ -1279,19 +1297,19 @@ fn bake_item_atlas(pix: &[u8], rows: usize, palette: &Texture8) -> Result<Vec<u8
 }
 
 /// Pack entry of the save prefix.
-const BIO_CARD_ENTRY: &str = "data/bio_card.dat";
+pub(crate) const BIO_CARD_ENTRY: &str = "data/bio_card.dat";
 /// The attract-demo reels (raw), packed under `demo/<hex>.dat`.
-const DEMO_FILES: [&str; 4] = ["PDEMO0.DAT", "PDEMO1.DAT", "PDEMO2.DAT", "PDEMO3.DAT"];
+pub(crate) const DEMO_FILES: [&str; 4] = ["PDEMO0.DAT", "PDEMO1.DAT", "PDEMO2.DAT", "PDEMO3.DAT"];
 /// Shipped name of the save prefix.
-const BIO_CARD_FILE: &str = "BIO_CARD.DAT";
+pub(crate) const BIO_CARD_FILE: &str = "BIO_CARD.DAT";
 /// Shipped name of the item-icon palette TIM.
-const STATUS_FILE: &str = "STATUS.TIM";
+pub(crate) const STATUS_FILE: &str = "STATUS.TIM";
 /// Shipped name of the player-shadow coverage TIM.
-const KAGE_FILE: &str = "KAGE.TIM";
+pub(crate) const KAGE_FILE: &str = "KAGE.TIM";
 
 /// How one `DATA` UI asset becomes its pack bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UiKind {
+pub(crate) enum UiKind {
     /// Copy the file raw; the renderer decodes the TIM itself.
     Raw,
     /// Decode a 16bpp direct-color TIM and encode it as BMP.
@@ -1347,7 +1365,7 @@ struct DataPlan {
 }
 
 /// The UI art table: pack entry, shipped file name and conversion kind.
-const UI_ASSETS: &[(&str, &str, UiKind)] = &[
+pub(crate) const UI_ASSETS: &[(&str, &str, UiKind)] = &[
     ("ui/status.tim", "STATUS.TIM", UiKind::Raw),
     ("ui/statface.tim", "STATFACE.TIM", UiKind::Raw),
     ("ui/blue.tim", "BLUE.TIM", UiKind::Raw),
@@ -1430,12 +1448,12 @@ const UI_ASSETS: &[(&str, &str, UiKind)] = &[
 ];
 
 /// The global weapon-effect metadata file names.
-const CORE_ESP_FILE: &str = "CORE00.ESP";
+pub(crate) const CORE_ESP_FILE: &str = "CORE00.ESP";
 /// The global weapon-effect art file name.
-const CORE_ETM_FILE: &str = "CORE00.ETM";
+pub(crate) const CORE_ETM_FILE: &str = "CORE00.ETM";
 
 /// The item atlas table: pack entry, shipped file name and row count.
-const ITEM_ASSETS: &[(&str, &str, usize)] = &[
+pub(crate) const ITEM_ASSETS: &[(&str, &str, usize)] = &[
     (items::ITEM_ALL_ENTRY, "ITEM_ALL.PIX", items::ITEM_ALL_ROWS),
     (items::ITEM_MIX_ENTRY, "ITEM_MIX.PIX", items::ITEM_MIX_ROWS),
     (items::MEDAL_ENTRY, "MEDAL.PIX", items::MEDAL_ROWS),
@@ -1924,6 +1942,7 @@ pub fn packed_source_hash() -> String {
     for &(name, source) in crate::ui::UI_SCRIPTS
         .iter()
         .chain(crate::enemy::ENEMY_SCRIPTS.iter())
+        .chain(crate::lua::GAME_SCRIPTS.iter())
         .chain(crate::language::LANGUAGE_FILES.iter())
     {
         feed(name.as_bytes());
@@ -1953,6 +1972,7 @@ fn base_manifest(language: &str) -> manifest::Manifest {
         id: BASE_PACK_ID.to_string(),
         name: Some("Resident Evil".to_string()),
         version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        description: None,
         kind: manifest::PackKind::Base,
         base: None,
         load_order: 0,
@@ -2274,7 +2294,7 @@ fn sheet_script_of(path: &Path) -> crate::charset::Script {
 }
 
 /// `stage1`..`stage7` (case-insensitive) -> `Some(1..=7)`.
-fn stage_dir_digit(name: &str) -> Option<u8> {
+pub(crate) fn stage_dir_digit(name: &str) -> Option<u8> {
     if name.len() != 6 || !name.get(..5)?.eq_ignore_ascii_case("stage") {
         return None;
     }
@@ -2976,7 +2996,7 @@ fn resolve_weapon_assets(players: Option<&Path>) -> Result<Vec<WeaponAsset>> {
 ///
 /// Returns `None` when the name is not an RDT name at all and an error when it
 /// looks like one but its hex digits are invalid.
-fn rdt_id_from_file_name(name: &str) -> Option<Result<RoomId>> {
+pub(crate) fn rdt_id_from_file_name(name: &str) -> Option<Result<RoomId>> {
     let lower = name.to_ascii_lowercase();
     let digits = lower.strip_prefix("room")?.strip_suffix(".rdt")?;
     if digits.len() != 4 {
