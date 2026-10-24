@@ -1904,7 +1904,48 @@ pub const BASE_PACK_ID: &str = "re1";
 /// scripts and language files, the manifest, or the compression policy. The
 /// launcher compares it with the pack's manifest and asks for a rebuild when
 /// they differ.
-pub const CONVERT_VERSION: u32 = 1;
+pub const CONVERT_VERSION: u32 = 2;
+
+/// A stable fingerprint of everything this engine packs itself: the conversion
+/// revision, the checked-in screen and enemy Lua, and the language sheets.
+/// Comparing it with a pack's manifest catches a changed script or language
+/// file even when nobody remembered to bump [`CONVERT_VERSION`].
+pub fn packed_source_hash() -> String {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET;
+    let mut feed = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+    };
+    feed(&CONVERT_VERSION.to_le_bytes());
+    for &(name, source) in crate::ui::UI_SCRIPTS
+        .iter()
+        .chain(crate::enemy::ENEMY_SCRIPTS.iter())
+        .chain(crate::language::LANGUAGE_FILES.iter())
+    {
+        feed(name.as_bytes());
+        feed(&[0]);
+        feed(source.as_bytes());
+        feed(&[0]);
+    }
+    format!("{hash:016x}")
+}
+
+#[cfg(test)]
+mod hash_tests {
+    use super::*;
+
+    #[test]
+    fn the_packed_source_hash_is_stable_and_sized() {
+        let first = packed_source_hash();
+        assert_eq!(first, packed_source_hash());
+        assert_eq!(first.len(), 16);
+        assert!(first.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+}
 /// The base pack's self-description.
 fn base_manifest(language: &str) -> manifest::Manifest {
     manifest::Manifest {
@@ -1922,6 +1963,7 @@ fn base_manifest(language: &str) -> manifest::Manifest {
         language: Some(language.to_string()),
         engine: None,
         convert_version: Some(CONVERT_VERSION),
+        source_hash: Some(packed_source_hash()),
         lua: Vec::new(),
     }
 }

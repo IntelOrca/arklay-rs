@@ -749,8 +749,8 @@ fn active_entities(game: &game::GameState) -> usize {
 ///
 /// `explicit` holds the `--mod` paths (always applied), `no_mods` ignores both
 /// the explicit and the discovered layers, `layers` is the user config's
-/// enable/disable/order selection over discovered mods, and `global_dir` is
-/// the per-user `mods/` directory (`None` disables that discovery, which keeps
+/// enable/disable/order selection over discovered mods, and `global_dirs`
+/// are the extra mod directories (`[]` disables that discovery, which keeps
 /// library/tests runs isolated).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModOptions {
@@ -760,15 +760,15 @@ pub struct ModOptions {
     pub no_mods: bool,
     /// The config's selection and order for discovered mods.
     pub layers: LayerOptions,
-    /// The per-user mods directory to scan in addition to the pack's sibling
-    /// `mods/` directory.
-    pub global_dir: Option<PathBuf>,
+    /// Extra mod directories to scan in addition to the pack's sibling
+    /// `mods/` directory, in precedence order.
+    pub global_dirs: Vec<PathBuf>,
 }
 
 /// Open a game pack together with its runtime mod layers.
 ///
 /// Unless `options.no_mods` is set, the pack's sibling `mods/` directory and
-/// `options.global_dir` are scanned for `.akpak` files and mod source
+/// `options.global_dirs` are scanned for `.akpak` files and mod source
 /// directories; `options.explicit` adds the `--mod` layers. The config's
 /// [`LayerOptions`] filters and orders the discovered layers, while an
 /// explicit layer always applies. A layer discovered and also passed
@@ -790,7 +790,7 @@ pub fn open_game_pack(path: &Path, options: &ModOptions, language: Option<&str>)
     }
     let mut candidates: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
-    for layer in crate::modding::discover_mods(path, options.global_dir.as_deref()) {
+    for layer in crate::modding::discover_mods(path, &options.global_dirs) {
         let canonical = std::fs::canonicalize(&layer).unwrap_or_else(|_| layer.clone());
         if seen.insert(canonical) {
             candidates.push(layer);
@@ -1055,6 +1055,8 @@ enum Backend {
     },
     /// The SDL_GPU device, which owns the window's swapchain.
     Gpu(Box<GpuRenderer>),
+    /// Held only while a backend is being replaced; never presented.
+    None,
 }
 
 /// The SDL window and the backend every screen shares.
@@ -1261,8 +1263,45 @@ impl Display {
     fn gpu(&mut self) -> Option<&mut GpuRenderer> {
         match &mut self.backend {
             Backend::Gpu(gpu) => Some(gpu),
-            Backend::Software { .. } => None,
+            Backend::Software { .. } | Backend::None => None,
         }
+    }
+
+    /// Switch the window to the backend `graphics` selects, keeping the
+    /// window itself (the launcher hands it to the game). A GPU failure falls
+    /// back to software, exactly like `Display::new`.
+    pub(crate) fn set_renderer(&mut self, graphics: Graphics) -> Result<()> {
+        let want_gpu = graphics.renderer == RendererKind::Gpu;
+        let is_gpu = matches!(self.backend, Backend::Gpu(_));
+        if want_gpu != is_gpu || matches!(self.backend, Backend::None) {
+            let old = std::mem::replace(&mut self.backend, Backend::None);
+            if let Backend::Gpu(mut gpu) = old {
+                gpu.release_window();
+                drop(gpu);
+            } else {
+                drop(old);
+            }
+            self.backend = if want_gpu {
+                match unsafe { GpuRenderer::new(self.window, graphics.render_scale, graphics.msaa) }
+                {
+                    Ok(gpu) => Backend::Gpu(Box::new(gpu)),
+                    Err(err) => {
+                        eprintln!("warning: GPU renderer unavailable ({err:#}); using software");
+                        Self::software_backend(self.window)?
+                    }
+                }
+            } else {
+                Self::software_backend(self.window)?
+            };
+        }
+        let Some(current) = self.graphics.as_mut() else {
+            return Ok(());
+        };
+        *current = graphics;
+        if !matches!(self.backend, Backend::Gpu(_)) {
+            current.renderer = RendererKind::Software;
+        }
+        Ok(())
     }
 
     /// Upload the framebuffer and draw it scaled to the window.
@@ -1281,6 +1320,7 @@ impl Display {
                 Ok(()) => Ok(()),
                 Err(err) => self.fall_back_to_software(&err),
             },
+            Backend::None => bail!("display has no renderer"),
         }
     }
 
@@ -1302,6 +1342,7 @@ impl Display {
                     Err(err) => self.fall_back_to_software(&err),
                 }
             }
+            Backend::None => bail!("display has no renderer"),
         }
     }
 
@@ -1326,6 +1367,12 @@ impl Display {
             bail!("SDL_RenderPresent failed: {}", sdl_error());
         }
         Ok(())
+    }
+
+    /// The window options currently in force, when this is an interactive
+    /// window.
+    pub(crate) fn graphics(&self) -> Option<&Graphics> {
+        self.graphics.as_ref()
     }
 
     /// Upload a native-resolution UI frame and draw it one-to-one over the
@@ -1448,7 +1495,9 @@ impl Display {
     fn capture(&self, path: &Path) -> Result<()> {
         match &self.backend {
             Backend::Software { renderer, .. } => capture_frame(renderer.0, path),
-            Backend::Gpu(_) => bail!("captures always use the software renderer"),
+            Backend::Gpu(_) | Backend::None => {
+                bail!("captures always use the software renderer")
+            }
         }
     }
 }
@@ -7900,6 +7949,7 @@ pub fn run_ui_with_mods(
         player_options,
         trace,
         authoring,
+        None,
     )
 }
 
@@ -7931,6 +7981,40 @@ pub fn run_root(
             renderer,
             ..Authoring::default()
         },
+        None,
+    )
+}
+
+/// The root boot on a window the caller already owns. The launcher uses this
+/// to hand its window to the game without ever opening a second one; closing
+/// the game window ends the process.
+#[allow(clippy::too_many_arguments)] // mirrors run_root
+pub(crate) fn run_root_with_display(
+    pack: &Path,
+    capture: Option<&Path>,
+    save_dir: &Path,
+    mods: &ModOptions,
+    debug_menu: bool,
+    language: Option<&str>,
+    renderer: Graphics,
+    player_options: player::Options,
+    display: &mut Display,
+) -> Result<()> {
+    run_ui_impl(
+        pack,
+        AppBoot::Boot,
+        capture,
+        save_dir,
+        mods,
+        debug_menu,
+        language,
+        player_options,
+        trace::TraceOptions::default(),
+        Authoring {
+            renderer,
+            ..Authoring::default()
+        },
+        Some(display),
     )
 }
 
@@ -7978,6 +8062,7 @@ fn run_ui_impl(
     player_options: player::Options,
     trace: trace::TraceOptions<'_>,
     authoring: Authoring<'_>,
+    shared: Option<&mut Display>,
 ) -> Result<()> {
     if capture.is_some()
         || trace.path.is_some()
@@ -8172,8 +8257,12 @@ fn run_ui_impl(
     } else if authoring.setup_script.is_some() {
         bail!("--setup-script requires a boot that opens a game session");
     }
-    let mut display = Display::new("Arklay", false, authoring.renderer)?;
-    run_app_loop(&mut app, &mut display, false)
+    let mut owned = None;
+    let display = match shared {
+        Some(display) => display,
+        None => owned.insert(Display::new("Arklay", false, authoring.renderer)?),
+    };
+    run_app_loop(&mut app, display, false)
 }
 
 /// Play a scripted `--input` over an app-level `--ui` boot (the title, the

@@ -31,9 +31,19 @@ engine still resolves replacements by stem but refuses to decode those formats.
 
 Running `arklay` with no arguments opens the startup launcher. Naming a pack
 on the command line skips it and boots the game directly. The launcher finds
-Steam's RE1 install, creates or refreshes `games/re1.akpak`, lists installed
-packs and rebuilds a pack when the converter changes. Play, mod handling and
-the release/nightly updater are the next checkpoints.
+Steam's RE1 install, creates or refreshes `games/re1.akpak`, plays a pack in
+the same window (closing the game window ends the process), discovers mods
+across the data roots and remembers their enable/disable state and order, and
+checks the release and nightly update tracks.
+
+Updates publish a small `build.json` next to the platform binary. `release`
+follows the latest normal release; `nightly` follows the rolling pre-release
+that CI replaces on every push to `main`. The launcher verifies the download's
+SHA-256, swaps the executable while keeping `<exe>.old`, and restarts; the
+Update screen can restore that previous image. Only CI builds (with
+`ARKLAY_CHANNEL` baked in) update themselves, so a local `cargo build` shows
+`DEV BUILD` instead. The Linux binary expects SDL3 to be installed on the
+system; Windows links SDL3 statically.
 
 Data resolves by precedence:
 

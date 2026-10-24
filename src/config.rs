@@ -8,7 +8,7 @@
 //! is the default configuration. The grammar is the same small TOML subset the pack manifest
 //! uses — comments, blank lines and `key = "value"`, plus TOML's literal
 //! `key = 'value'` strings so a Windows path needs no escaping — with two
-//! root keys and five tables (the `[graphics]` table also takes bare integers
+//! root keys and six tables (the `[graphics]` table also takes bare integers
 //! and booleans, and so does `[game]`):
 //!
 //! ```toml
@@ -56,6 +56,14 @@
 //! [games]
 //! re1_source = 'C:\Games\Resident Evil'
 //! re1_build = "21744136"
+//!
+//! # Update track and the last build found by a check.
+//! [updates]
+//! channel = "release"        # or "nightly"
+//! check = true               # check on startup
+//! last_check = 1775          # unix seconds
+//! available_version = "0.1.1"
+//! available_sha = "..."
 //! ```
 //!
 //! Saved games default to `<config dir>/save` (the `savedat1..8.dat` slot
@@ -65,7 +73,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::budget;
 use crate::controls::{ACTIONS, Action, Bindings, Source};
@@ -112,8 +120,62 @@ pub struct Config {
     pub mods: Mods,
     /// The `[games]` launcher bookkeeping.
     pub games: Games,
+    /// The `[updates]` channel and last found build.
+    pub updates: Updates,
     /// The `[game]` gameplay options.
     pub game: Game,
+}
+
+/// The update track the launcher follows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UpdateChannel {
+    #[default]
+    Release,
+    Nightly,
+}
+
+impl UpdateChannel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Release => "release",
+            Self::Nightly => "nightly",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "release" => Some(Self::Release),
+            "nightly" => Some(Self::Nightly),
+            _ => None,
+        }
+    }
+}
+
+/// The `[updates]` table: channel, startup check and the last found build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Updates {
+    pub channel: UpdateChannel,
+    /// Check for a newer build on startup.
+    pub check: bool,
+    /// Unix seconds of the last completed check.
+    pub last_check: u64,
+    /// The channel of the stored available build.
+    pub available_channel: Option<UpdateChannel>,
+    pub available_version: Option<String>,
+    pub available_sha: Option<String>,
+}
+
+impl Default for Updates {
+    fn default() -> Self {
+        Self {
+            channel: UpdateChannel::Release,
+            check: true,
+            last_check: 0,
+            available_channel: None,
+            available_version: None,
+            available_sha: None,
+        }
+    }
 }
 
 /// The `[games]` launcher bookkeeping: where each game's installation is.
@@ -149,6 +211,7 @@ enum Table {
     Graphics,
     Mods,
     Games,
+    Updates,
     Game,
     /// A table that could not be used; its keys are skipped.
     Ignored,
@@ -236,11 +299,13 @@ impl Config {
         let mut seen_graphics = false;
         let mut seen_mods = false;
         let mut seen_games = false;
+        let mut seen_updates = false;
         let mut seen_game = false;
         let mut bound = Vec::new();
         let mut graphics_keys: Vec<String> = Vec::new();
         let mut mod_keys: Vec<String> = Vec::new();
         let mut games_keys: Vec<String> = Vec::new();
+        let mut update_keys: Vec<String> = Vec::new();
         let mut game_keys: Vec<String> = Vec::new();
         for (index, raw) in text.lines().enumerate() {
             let line = index + 1;
@@ -266,11 +331,17 @@ impl Config {
                         seen_games = true;
                         Table::Games
                     }
+                    Some("updates") if !seen_updates => {
+                        seen_updates = true;
+                        Table::Updates
+                    }
                     Some("game") if !seen_game => {
                         seen_game = true;
                         Table::Game
                     }
-                    Some(name @ ("bindings" | "graphics" | "mods" | "games" | "game")) => {
+                    Some(
+                        name @ ("bindings" | "graphics" | "mods" | "games" | "updates" | "game"),
+                    ) => {
                         warnings.push(format!("line {line}: duplicate [{name}] table ignored"));
                         Table::Ignored
                     }
@@ -293,6 +364,9 @@ impl Config {
                 }
                 Table::Mods => parse_mods_line(&mut config.mods, &mut mod_keys, content, line),
                 Table::Games => parse_games_line(&mut config.games, &mut games_keys, content, line),
+                Table::Updates => {
+                    parse_updates_line(&mut config.updates, &mut update_keys, content, line)
+                }
                 Table::Game => parse_game_line(&mut config.game, &mut game_keys, content, line),
                 Table::Bindings => parse_binding_line(&mut config, &mut bound, content, line),
             };
@@ -337,6 +411,14 @@ impl Config {
             }
             out.push_str("[games]\n");
             out.push_str(&games);
+        }
+        let updates = render_updates(&self.updates);
+        if !updates.is_empty() {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str("[updates]\n");
+            out.push_str(&updates);
         }
         if let Some(bindings) = &self.bindings {
             if !out.is_empty() {
@@ -390,6 +472,16 @@ impl Config {
         Self::update(path, |config| {
             config.bindings = (*bindings != Bindings::default()).then(|| bindings.clone());
         })
+    }
+
+    /// Persist the `[mods]` enable/disable/order selection.
+    pub fn save_mods(path: &Path, mods: &Mods) -> Result<()> {
+        Self::update(path, |config| config.mods = mods.clone())
+    }
+
+    /// Persist the update channel, check settings and last found build.
+    pub fn save_updates(path: &Path, updates: &Updates) -> Result<()> {
+        Self::update(path, |config| config.updates = updates.clone())
     }
 
     /// Persist the launcher's remembered Resident Evil source and Steam build
@@ -665,6 +757,84 @@ fn render_games(games: &Games) -> String {
     }
     if let Some(build) = &games.re1_build {
         out.push_str(&format!("re1_build = {}\n", quote(build)));
+    }
+    out
+}
+
+/// Parse one `[updates]` line into `updates`.
+fn parse_updates_line(
+    updates: &mut Updates,
+    seen: &mut Vec<String>,
+    content: &str,
+    line: usize,
+) -> Result<()> {
+    let (key, value) = key_value(content, line)?;
+    if seen.iter().any(|seen| seen == key) {
+        bail!("line {line}: duplicate key `{key}`");
+    }
+    seen.push(key.to_string());
+    let quoted = || -> Result<String> {
+        if !value.starts_with(['"', '\'']) {
+            bail!("line {line}: `{key}` expects a quoted string");
+        }
+        parse_quoted(value, line)
+    };
+    match key {
+        "channel" => {
+            let text = quoted()?;
+            updates.channel = UpdateChannel::parse(&text)
+                .with_context(|| format!("line {line}: channel must be release or nightly"))?;
+        }
+        "check" => {
+            updates.check = match value {
+                "true" => true,
+                "false" => false,
+                _ => bail!("line {line}: `check` expects true or false"),
+            };
+        }
+        "last_check" => {
+            updates.last_check = value
+                .parse::<u64>()
+                .map_err(|_| anyhow!("line {line}: bad last_check {value}"))?;
+        }
+        "available_channel" => {
+            let text = quoted()?;
+            updates.available_channel = Some(
+                UpdateChannel::parse(&text)
+                    .with_context(|| format!("line {line}: bad available_channel"))?,
+            );
+        }
+        "available_version" => updates.available_version = Some(quoted()?),
+        "available_sha" => updates.available_sha = Some(quoted()?),
+        other => bail!("line {line}: unknown key `{other}`"),
+    }
+    Ok(())
+}
+
+/// The `[updates]` keys that differ from the defaults.
+fn render_updates(updates: &Updates) -> String {
+    let defaults = Updates::default();
+    let mut out = String::new();
+    if updates.channel != defaults.channel {
+        out.push_str(&format!("channel = {}\n", quote(updates.channel.as_str())));
+    }
+    if updates.check != defaults.check {
+        out.push_str(&format!("check = {}\n", updates.check));
+    }
+    if updates.last_check != defaults.last_check {
+        out.push_str(&format!("last_check = {}\n", updates.last_check));
+    }
+    if let Some(channel) = updates.available_channel {
+        out.push_str(&format!(
+            "available_channel = {}\n",
+            quote(channel.as_str())
+        ));
+    }
+    if let Some(version) = &updates.available_version {
+        out.push_str(&format!("available_version = {}\n", quote(version)));
+    }
+    if let Some(sha) = &updates.available_sha {
+        out.push_str(&format!("available_sha = {}\n", quote(sha)));
     }
     out
 }
@@ -964,6 +1134,7 @@ mod tests {
             graphics: Graphics::default(),
             mods: Mods::default(),
             games: Games::default(),
+            updates: Updates::default(),
             game: Game::default(),
         }
         .render();
@@ -1448,6 +1619,33 @@ mod tests {
         let (config, warnings) = Config::load(&path);
         assert_eq!(config, Config::default());
         assert!(warnings[0].contains("arklay.toml"), "{warnings:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_updates_table_roundtrips_and_saves() {
+        let text = "[updates]\nchannel = \"nightly\"\ncheck = false\nlast_check = 1775\n\
+                    available_channel = \"nightly\"\navailable_version = \"0.1.0-nightly\"\n\
+                    available_sha = \"abc123\"\n";
+        let config = Config::parse(text).unwrap();
+        assert_eq!(config.updates.channel, UpdateChannel::Nightly);
+        assert!(!config.updates.check);
+        assert_eq!(config.updates.last_check, 1775);
+        assert_eq!(config.updates.available_sha.as_deref(), Some("abc123"));
+        assert_eq!(Config::parse(&config.render()).unwrap(), config);
+
+        let dir =
+            std::env::temp_dir().join(format!("arklay-config-{}-updates", std::process::id()));
+        let path = dir.join("arklay.toml");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let updates = Updates {
+            channel: UpdateChannel::Nightly,
+            available_version: Some("0.1.0-nightly".to_string()),
+            ..Updates::default()
+        };
+        Config::save_updates(&path, &updates).unwrap();
+        assert_eq!(Config::load(&path).0.updates, updates);
         let _ = fs::remove_dir_all(&dir);
     }
 

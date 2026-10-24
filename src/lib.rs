@@ -72,6 +72,7 @@ pub mod trace;
 pub mod transition;
 pub mod tween;
 pub mod ui;
+pub mod update;
 pub mod verify;
 pub mod video;
 pub mod voice;

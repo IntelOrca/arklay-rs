@@ -6,10 +6,11 @@
 //! selecting a row, changing a status or resizing the window never shifts a
 //! table column.
 //!
-//! This checkpoint adds the real pack list, Steam detection, the remembered
-//! source folder and the install/rebuild conversion with a live progress
-//! screen. Play and mod management still land in the next checkpoint; their
-//! actions say so instead of pretending.
+//! Play hands this window to the game in-process; closing the game window
+//! ends the process. Mods are discovered from every data root, filtered by
+//! the pack's base id, and toggled or reordered through `[mods]` in
+//! `arklay.toml`. Installs and rebuilds run on a worker thread with a live
+//! progress screen and cancellation.
 
 mod text;
 
@@ -23,7 +24,7 @@ use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use sdl3_sys::dialog::SDL_ShowOpenFolderDialog;
 use sdl3_sys::events::{
     SDL_EVENT_KEY_DOWN, SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_EVENT_QUIT, SDL_EVENT_WINDOW_EXPOSED,
@@ -40,15 +41,19 @@ use sdl3_sys::scancode::{
 };
 
 use crate::build_info;
-use crate::config::Config;
+use crate::config::{Config, Mods};
 use crate::convert::{self, CONVERT_VERSION};
-use crate::engine::Display;
+use crate::engine::{self, Display, ModOptions};
 use crate::logging;
+use crate::manifest;
+use crate::modding;
 use crate::pack;
 use crate::paths;
+use crate::player;
 use crate::progress::ProgressSnapshot;
 use crate::steam;
-use crate::video::RendererKind;
+use crate::update::{self, UpdateInfo};
+use crate::video::{self, RendererKind};
 
 /// A blended text colour.
 #[derive(Clone, Copy)]
@@ -284,13 +289,15 @@ struct Source {
     build: Option<String>,
 }
 
-/// One row of the (placeholder) mods list.
+/// One discovered mod for the selected game.
 #[derive(Clone)]
 struct ModRow {
     name: String,
     id: String,
     version: String,
     enabled: bool,
+    load_order: i32,
+    path: PathBuf,
 }
 
 /// A modal message with a way back.
@@ -339,6 +346,13 @@ struct Job {
     rebuild: bool,
 }
 
+/// A background engine download.
+struct UpdateJob {
+    receiver: mpsc::Receiver<Result<(), String>>,
+    cancel: Arc<AtomicBool>,
+    state: Arc<Mutex<ProgressState>>,
+}
+
 /// The result of one folder-dialog invocation, filled in by the SDL callback.
 struct DialogState {
     done: AtomicBool,
@@ -384,14 +398,17 @@ struct Launcher {
     play_index: usize,
     update_index: usize,
     mods_index: usize,
+    config: Config,
     packs: Vec<PackRow>,
     mods: Vec<ModRow>,
     source: Option<Source>,
     target: PathBuf,
-    channel_nightly: bool,
-    auto_check: bool,
     message: Option<Message>,
     job: Option<Job>,
+    update_job: Option<UpdateJob>,
+    checking: bool,
+    check_rx: Option<mpsc::Receiver<Result<Option<UpdateInfo>, String>>>,
+    auto_update: bool,
     confirm_cancel: bool,
     dialog: Option<Arc<DialogState>>,
     capture_progress: Option<ProgressState>,
@@ -420,6 +437,13 @@ impl Launcher {
                 })
             });
         let target = target_for(&packs);
+        let mods = scan_mods(
+            packs
+                .iter()
+                .find(|pack| pack.id.eq_ignore_ascii_case("re1")),
+            config,
+            &mod_dirs(),
+        );
         Ok(Self {
             screen: if packs.is_empty() {
                 Screen::Install
@@ -430,33 +454,17 @@ impl Launcher {
             play_index: 0,
             update_index: 0,
             mods_index: 0,
+            config: config.clone(),
             packs,
-            mods: vec![
-                ModRow {
-                    name: "HD replacement demo".to_string(),
-                    id: "hd".to_string(),
-                    version: "0.1.0".to_string(),
-                    enabled: true,
-                },
-                ModRow {
-                    name: "Balance tweaks".to_string(),
-                    id: "balance".to_string(),
-                    version: "0.1.0".to_string(),
-                    enabled: false,
-                },
-                ModRow {
-                    name: "Demo reels".to_string(),
-                    id: "demo".to_string(),
-                    version: "0.1.0".to_string(),
-                    enabled: true,
-                },
-            ],
+            mods,
             source,
             target,
-            channel_nightly: false,
-            auto_check: true,
             message: None,
             job: None,
+            update_job: None,
+            checking: false,
+            check_rx: None,
+            auto_update: false,
             confirm_cancel: false,
             dialog: None,
             capture_progress: None,
@@ -523,6 +531,10 @@ impl Launcher {
                     .job
                     .as_ref()
                     .is_some_and(|job| job.cancel.load(Ordering::Relaxed))
+                    || self
+                        .update_job
+                        .as_ref()
+                        .is_some_and(|job| job.cancel.load(Ordering::Relaxed))
                 {
                     "CANCELLING..."
                 } else {
@@ -537,6 +549,7 @@ impl Launcher {
     fn draw_main(&mut self) {
         for (index, label) in MAIN_ITEMS.iter().enumerate() {
             let stale = self.re1_pack().is_some_and(|pack| pack.stale);
+            let update = self.config.updates.available_version.is_some();
             let (status, color) = match index {
                 0 => (
                     format!(
@@ -557,14 +570,22 @@ impl Launcher {
                     Color::AMBER,
                 ),
                 2 => (
-                    if stale {
-                        "PAK REBUILD".to_string()
-                    } else {
-                        String::new()
+                    match (update, stale) {
+                        (true, true) => "UPDATE + REBUILD".to_string(),
+                        (true, false) => "UPDATE AVAILABLE".to_string(),
+                        (false, true) => "PAK REBUILD".to_string(),
+                        (false, false) => String::new(),
                     },
                     Color::AMBER,
                 ),
-                3 => (String::new(), Color::DIM),
+                3 => (
+                    format!(
+                        "{} MOD{}",
+                        self.mods.len(),
+                        if self.mods.len() == 1 { "" } else { "S" }
+                    ),
+                    Color::DIM,
+                ),
                 _ => (String::new(), Color::DIM),
             };
             let row = 4 + index;
@@ -705,26 +726,55 @@ impl Launcher {
     fn draw_update(&mut self) {
         self.grid.draw(&mut self.frame, 3, 4, "UPDATE", Color::BODY);
         let pack_stale = self.re1_pack().map(|pack| pack.stale);
+        let published = build_info::is_published();
+        let available = self.config.updates.available_version.clone();
         for (index, label) in UPDATE_ITEMS.iter().enumerate() {
             let (status, color) = match index {
-                0 => ("M4".to_string(), Color::DIM),
-                1 => ("M4".to_string(), Color::DIM),
+                0 => {
+                    if !published {
+                        ("DEV BUILD".to_string(), Color::DIM)
+                    } else if self.checking {
+                        ("CHECKING...".to_string(), Color::AMBER)
+                    } else if available.is_some() {
+                        ("UPDATE AVAILABLE".to_string(), Color::AMBER)
+                    } else if self.config.updates.last_check > 0 {
+                        ("UP TO DATE".to_string(), Color::DIM)
+                    } else {
+                        (String::new(), Color::DIM)
+                    }
+                }
+                1 => {
+                    if !published {
+                        ("DEV BUILD".to_string(), Color::DIM)
+                    } else if let Some(version) = &available {
+                        (version.clone(), Color::AMBER)
+                    } else {
+                        ("UP TO DATE".to_string(), Color::DIM)
+                    }
+                }
                 2 => match pack_stale {
                     None => ("NOT INSTALLED".to_string(), Color::DIM),
                     Some(true) => ("REQUIRED".to_string(), Color::AMBER),
                     Some(false) => ("UP TO DATE".to_string(), Color::DIM),
                 },
-                3 => ("M4".to_string(), Color::DIM),
-                4 => (
-                    if self.channel_nightly {
-                        "NIGHTLY".to_string()
+                3 => (
+                    if update::rollback_available() {
+                        "AVAILABLE".to_string()
                     } else {
-                        "RELEASE".to_string()
+                        "NONE".to_string()
                     },
                     Color::BODY,
                 ),
+                4 => (
+                    match self.config.updates.channel {
+                        crate::config::UpdateChannel::Release => "RELEASE",
+                        crate::config::UpdateChannel::Nightly => "NIGHTLY",
+                    }
+                    .to_string(),
+                    Color::BODY,
+                ),
                 _ => (
-                    if self.auto_check {
+                    if self.config.updates.check {
                         "ON".to_string()
                     } else {
                         "OFF".to_string()
@@ -741,10 +791,18 @@ impl Launcher {
     fn draw_mods(&mut self) {
         self.grid
             .draw(&mut self.frame, 3, 4, "MODS - RESIDENT EVIL", Color::BODY);
-        self.table_header(5, &[(4, "ON"), (9, "MOD"), (46, "ID"), (62, "VERSION")]);
+        self.table_header(5, &[(4, "ON"), (9, "MOD"), (46, "ID"), (68, "VERSION")]);
         if self.mods.is_empty() {
             self.grid
                 .draw(&mut self.frame, 7, 4, "NO MODS DISCOVERED.", Color::DIM);
+            let dir = paths::mods_dir(&paths::primary_data_dir());
+            self.grid.draw(
+                &mut self.frame,
+                9,
+                4,
+                &truncate(&format!("PUT MODS IN {}", dir.display()), 72),
+                Color::DIM,
+            );
             return;
         }
         if self.mods_index >= self.mods.len() {
@@ -761,11 +819,20 @@ impl Launcher {
                 &[
                     (4, mark),
                     (9, &truncate(&row.name, 34)),
-                    (46, &truncate(&row.id, 14)),
-                    (62, &truncate(&row.version, 12)),
+                    (46, &truncate(&row.id, 20)),
+                    (68, &truncate(&row.version, 9)),
                 ],
             );
             self.hits.push((line, index));
+        }
+        if let Some(row) = self.mods.get(self.mods_index) {
+            self.grid.draw(
+                &mut self.frame,
+                20,
+                4,
+                &truncate(&row.path.display().to_string(), 72),
+                Color::DIM,
+            );
         }
     }
 
@@ -775,11 +842,18 @@ impl Launcher {
                 .lock()
                 .map(|state| state.clone())
                 .unwrap_or_default()
+        } else if let Some(job) = &self.update_job {
+            job.state
+                .lock()
+                .map(|state| state.clone())
+                .unwrap_or_default()
         } else {
             self.capture_progress.clone().unwrap_or_default()
         };
         let rebuild = self.job.as_ref().is_some_and(|job| job.rebuild);
-        let title = if rebuild {
+        let title = if self.update_job.is_some() {
+            "UPDATING ENGINE"
+        } else if rebuild {
             "REBUILDING GAME PACK"
         } else {
             "INSTALLING RESIDENT EVIL"
@@ -920,7 +994,12 @@ impl Launcher {
     }
 
     /// Handle one key press. Returns true when the launcher should close.
-    fn key(&mut self, scancode: SDL_Scancode, modifiers: SDL_Keymod, display: &Display) -> bool {
+    fn key(
+        &mut self,
+        scancode: SDL_Scancode,
+        modifiers: SDL_Keymod,
+        display: &mut Display,
+    ) -> bool {
         if self.screen == Screen::Progress {
             if scancode == SDL_SCANCODE_ESCAPE {
                 self.confirm_cancel = !self.confirm_cancel;
@@ -928,6 +1007,9 @@ impl Launcher {
                 && self.confirm_cancel
             {
                 if let Some(job) = &self.job {
+                    job.cancel.store(true, Ordering::Relaxed);
+                }
+                if let Some(job) = &self.update_job {
                     job.cancel.store(true, Ordering::Relaxed);
                 }
                 self.confirm_cancel = false;
@@ -996,11 +1078,16 @@ impl Launcher {
             }
             SDL_SCANCODE_O => {
                 if self.screen == Screen::Mods {
-                    self.show_message(
-                        "MODS FOLDER",
-                        &["Mod discovery and the folder action arrive in M3."],
-                        Screen::Mods,
-                    );
+                    let dir = match self.mods.get(self.mods_index) {
+                        Some(row) if row.path.is_dir() => row.path.clone(),
+                        Some(row) => row
+                            .path
+                            .parent()
+                            .map(Path::to_path_buf)
+                            .unwrap_or_else(|| row.path.clone()),
+                        None => paths::mods_dir(&paths::primary_data_dir()),
+                    };
+                    open_folder(&dir);
                 }
             }
             _ => {}
@@ -1019,26 +1106,12 @@ impl Launcher {
     }
 
     /// Enter/Space on the current screen. Returns true to close the launcher.
-    fn activate(&mut self, display: &Display) -> bool {
+    fn activate(&mut self, display: &mut Display) -> bool {
         match self.screen {
-            Screen::Main => return self.activate_main(display),
-            Screen::Play => {
-                if let Some(pack) = self.packs.get(self.play_index) {
-                    let name = pack.name.clone();
-                    let error = pack.error.clone();
-                    if let Some(error) = error {
-                        self.show_message("PACK ERROR", &[&error], Screen::Play);
-                    } else {
-                        self.show_message(
-                            "PLAY",
-                            &[&format!("{name} is wired up in M3.")],
-                            Screen::Play,
-                        );
-                    }
-                }
-            }
+            Screen::Main => return self.activate_main(),
+            Screen::Play => return self.play(display),
             Screen::Install => self.install(),
-            Screen::Update => self.activate_update(display),
+            Screen::Update => self.activate_update(),
             Screen::Mods => self.toggle_mod(),
             Screen::Progress => {}
             Screen::Message => self.dismiss_message(),
@@ -1046,7 +1119,7 @@ impl Launcher {
         false
     }
 
-    fn activate_main(&mut self, display: &Display) -> bool {
+    fn activate_main(&mut self) -> bool {
         match self.main_index {
             0 => {
                 self.screen = Screen::Play;
@@ -1058,53 +1131,322 @@ impl Launcher {
                 self.update_index = 0;
             }
             3 => {
+                self.refresh_mods();
                 self.screen = Screen::Mods;
                 self.mods_index = 0;
             }
             4 => return true,
             _ => {}
         }
-        let _ = display;
         false
     }
 
-    fn activate_update(&mut self, display: &Display) {
+    fn activate_update(&mut self) {
         match self.update_index {
-            0 => self.show_message(
-                "CHECK FOR UPDATES",
-                &["The release/nightly check arrives in M4."],
-                Screen::Update,
-            ),
-            1 => self.show_message(
-                "UPDATE ENGINE",
-                &["Engine downloads and the in-place swap arrive in M4."],
-                Screen::Update,
-            ),
+            0 => self.start_check(true),
+            1 => self.start_update(),
             2 => self.install(),
-            3 => self.show_message(
-                "ROLL BACK LAST UPDATE",
-                &["Rollback arrives with the updater in M4."],
-                Screen::Update,
-            ),
-            4 => self.channel_nightly = !self.channel_nightly,
-            5 => self.auto_check = !self.auto_check,
+            3 => self.rollback(),
+            4 => self.toggle_channel(),
+            5 => self.toggle_auto_check(),
             _ => {}
         }
-        let _ = display;
     }
 
     fn toggle_update(&mut self) {
         if self.update_index == 4 {
-            self.channel_nightly = !self.channel_nightly;
+            self.toggle_channel();
         } else if self.update_index == 5 {
-            self.auto_check = !self.auto_check;
+            self.toggle_auto_check();
+        }
+    }
+
+    /// Check on startup when enabled and the six-hour cache has expired.
+    fn maybe_start_check(&mut self) {
+        if !build_info::is_published()
+            || !self.config.updates.check
+            || self.checking
+            || self.config.updates.last_check.saturating_add(6 * 60 * 60) > unix_now()
+        {
+            return;
+        }
+        self.start_check(false);
+    }
+
+    fn start_check(&mut self, manual: bool) {
+        if self.checking {
+            return;
+        }
+        if !build_info::is_published() {
+            if manual {
+                self.show_message(
+                    "CHECK FOR UPDATES",
+                    &["DEVELOPMENT BUILDS DO NOT UPDATE THEMSELVES."],
+                    Screen::Update,
+                );
+            }
+            return;
+        }
+        let channel = self.config.updates.channel;
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(update::check(channel).map_err(|err| format!("{err:#}")));
+        });
+        self.check_rx = Some(receiver);
+        self.checking = true;
+    }
+
+    fn poll_check(&mut self) -> bool {
+        let Some(receiver) = &self.check_rx else {
+            return false;
+        };
+        let received = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => Err("the update check stopped".to_string()),
+        };
+        self.check_rx = None;
+        self.checking = false;
+        self.config.updates.last_check = unix_now();
+        match received {
+            Ok(Some(info)) => {
+                self.config.updates.available_channel =
+                    crate::config::UpdateChannel::parse(&info.channel);
+                self.config.updates.available_version = Some(info.version);
+                self.config.updates.available_sha = Some(info.sha);
+            }
+            Ok(None) => {
+                self.config.updates.available_channel = None;
+                self.config.updates.available_version = None;
+                self.config.updates.available_sha = None;
+            }
+            Err(err) => {
+                logging::write(&format!("update check failed: {err}"));
+            }
+        }
+        self.save_updates();
+        true
+    }
+
+    fn clear_available_if_current(&mut self) {
+        let updates = &self.config.updates;
+        let Some(sha) = updates.available_sha.as_deref() else {
+            return;
+        };
+        let current = match updates.available_channel {
+            Some(crate::config::UpdateChannel::Nightly) => {
+                !sha.is_empty() && sha == build_info::COMMIT
+            }
+            _ => updates.available_version.as_deref() == Some(build_info::VERSION),
+        };
+        if current {
+            self.config.updates.available_channel = None;
+            self.config.updates.available_version = None;
+            self.config.updates.available_sha = None;
+            self.save_updates();
+        }
+    }
+
+    fn save_updates(&self) {
+        if let Err(err) = Config::save_updates(&Config::default_path(), &self.config.updates) {
+            logging::write(&format!("warning: update settings not saved: {err:#}"));
+        }
+    }
+
+    fn toggle_channel(&mut self) {
+        self.config.updates.channel = match self.config.updates.channel {
+            crate::config::UpdateChannel::Release => crate::config::UpdateChannel::Nightly,
+            crate::config::UpdateChannel::Nightly => crate::config::UpdateChannel::Release,
+        };
+        self.config.updates.available_channel = None;
+        self.config.updates.available_version = None;
+        self.config.updates.available_sha = None;
+        self.save_updates();
+        self.start_check(true);
+    }
+
+    fn toggle_auto_check(&mut self) {
+        self.config.updates.check = !self.config.updates.check;
+        self.save_updates();
+    }
+
+    fn start_update(&mut self) {
+        if !build_info::is_published() {
+            self.show_message(
+                "UPDATE ENGINE",
+                &["DEVELOPMENT BUILDS DO NOT UPDATE THEMSELVES."],
+                Screen::Update,
+            );
+            return;
+        }
+        let (Some(version), Some(sha)) = (
+            self.config.updates.available_version.clone(),
+            self.config.updates.available_sha.clone(),
+        ) else {
+            self.show_message(
+                "UPDATE ENGINE",
+                &["THERE IS NO NEWER PUBLISHED BUILD."],
+                Screen::Update,
+            );
+            return;
+        };
+        let channel = self.config.updates.channel;
+        // The feed is re-fetched so the download URL and checksum come from
+        // the same JSON as the offered version.
+        let (sender, receiver) = mpsc::channel();
+        let state = Arc::new(Mutex::new(ProgressState {
+            label: "download".to_string(),
+            item: "arklay".to_string(),
+            ..ProgressState::default()
+        }));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let thread_state = Arc::clone(&state);
+        let thread_cancel = Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            let result = (|| -> Result<()> {
+                let Some(info) = update::check(channel)? else {
+                    bail!("there is no newer published build");
+                };
+                if info.version != version || info.sha != sha {
+                    bail!("the update feed changed; check for updates again");
+                }
+                let exe = update::current_exe()?;
+                let dest = update::staging_path(&exe);
+                let start = std::time::Instant::now();
+                update::download(&info, &dest, &thread_cancel, |done, total| {
+                    if let Ok(mut state) = thread_state.lock() {
+                        state.done = done;
+                        state.total = total;
+                        state.overall = if total > 0 {
+                            done.min(total) as f64 / total as f64
+                        } else {
+                            0.0
+                        };
+                        state.elapsed = start.elapsed();
+                    }
+                })
+            })();
+            let _ = sender.send(result.map_err(|err| format!("{err:#}")));
+        });
+        self.update_job = Some(UpdateJob {
+            receiver,
+            cancel,
+            state,
+        });
+        self.job = None;
+        self.screen = Screen::Progress;
+        self.confirm_cancel = false;
+    }
+
+    fn poll_update_job(&mut self) -> bool {
+        let Some(job) = &self.update_job else {
+            return false;
+        };
+        let result = match job.receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => Err("the update download stopped".to_string()),
+        };
+        let job = self.update_job.take().expect("an update job");
+        if job.cancel.load(Ordering::Relaxed) {
+            logging::write("update cancelled");
+            self.show_message(
+                "UPDATE CANCELLED",
+                &["THE ENGINE WAS NOT CHANGED."],
+                Screen::Update,
+            );
+            return true;
+        }
+        match result {
+            Ok(()) => {
+                logging::write("update: installing the downloaded engine");
+                if let Err(err) = update::install_staged() {
+                    self.show_message(
+                        "UPDATE FAILED",
+                        &[&truncate(&format!("{err:#}"), 72)],
+                        Screen::Update,
+                    );
+                    return true;
+                }
+                if let Err(err) = update::restart() {
+                    self.show_message(
+                        "RESTART FAILED",
+                        &[
+                            &truncate(&format!("{err:#}"), 72),
+                            "RESTART ARKLAY MANUALLY.",
+                        ],
+                        Screen::Update,
+                    );
+                    return true;
+                }
+                std::process::exit(0);
+            }
+            Err(err) => {
+                logging::write(&format!("update failed: {err}"));
+                self.show_message(
+                    "UPDATE FAILED",
+                    &[&truncate(&err, 72), "SEE THE LOG FOR DETAILS."],
+                    Screen::Update,
+                );
+            }
+        }
+        true
+    }
+
+    fn rollback(&mut self) {
+        if !update::rollback_available() {
+            self.show_message(
+                "ROLL BACK LAST UPDATE",
+                &["THERE IS NO PREVIOUS BUILD TO RESTORE."],
+                Screen::Update,
+            );
+            return;
+        }
+        match update::rollback() {
+            Ok(()) => {
+                logging::write("update: rolling back");
+                if let Err(err) = update::restart() {
+                    self.show_message(
+                        "RESTART FAILED",
+                        &[
+                            &truncate(&format!("{err:#}"), 72),
+                            "RESTART ARKLAY MANUALLY.",
+                        ],
+                        Screen::Update,
+                    );
+                    return;
+                }
+                std::process::exit(0);
+            }
+            Err(err) => self.show_message(
+                "ROLL BACK FAILED",
+                &[&truncate(&format!("{err:#}"), 72)],
+                Screen::Update,
+            ),
+        }
+    }
+
+    fn refresh_mods(&mut self) {
+        let pack = self.re1_pack().cloned();
+        self.mods = scan_mods(pack.as_ref(), &self.config, &mod_dirs());
+        if self.mods_index >= self.mods.len() {
+            self.mods_index = self.mods.len().saturating_sub(1);
         }
     }
 
     fn toggle_mod(&mut self) {
+        let Some((id, enabled)) = self
+            .mods
+            .get(self.mods_index)
+            .map(|row| (row.id.clone(), !row.enabled))
+        else {
+            return;
+        };
         if let Some(row) = self.mods.get_mut(self.mods_index) {
-            row.enabled = !row.enabled;
+            row.enabled = enabled;
         }
+        set_mod_enabled(&mut self.config.mods, &id, enabled);
+        self.save_mods();
     }
 
     fn move_mod(&mut self, delta: isize) {
@@ -1115,6 +1457,14 @@ impl Launcher {
         let target = (self.mods_index as isize + delta).rem_euclid(len as isize) as usize;
         self.mods.swap(self.mods_index, target);
         self.mods_index = target;
+        self.config.mods.order = self.mods.iter().map(|row| row.id.clone()).collect();
+        self.save_mods();
+    }
+
+    fn save_mods(&self) {
+        if let Err(err) = Config::save_mods(&Config::default_path(), &self.config.mods) {
+            logging::write(&format!("warning: mod selection not saved: {err:#}"));
+        }
     }
 
     fn show_message(&mut self, title: &str, lines: &[&str], back: Screen) {
@@ -1221,6 +1571,73 @@ impl Launcher {
         self.message = None;
     }
 
+    /// Hand the launcher's window to the game. Returning true means the
+    /// process should now exit, which is what closing the game window does.
+    fn play(&mut self, display: &mut Display) -> bool {
+        let Some(pack) = self.packs.get(self.play_index).cloned() else {
+            return false;
+        };
+        if let Some(error) = &pack.error {
+            self.show_message("PACK ERROR", &[error], Screen::Play);
+            return false;
+        }
+        display.note_window_size();
+        let mut graphics = self.config.graphics;
+        if let Some(current) = display.graphics().cloned() {
+            graphics.fullscreen = current.fullscreen;
+            graphics.display = current.display;
+            graphics.window_width = current.window_width;
+            graphics.window_height = current.window_height;
+        }
+        video::set_aspect(graphics.aspect);
+        if let Err(err) = display.set_renderer(graphics) {
+            self.show_message("GAME FAILED", &[&format!("{err:#}")], Screen::Play);
+            return false;
+        }
+        let save_dir = self
+            .config
+            .save_dir
+            .clone()
+            .unwrap_or_else(Config::default_save_dir);
+        let mods = ModOptions {
+            explicit: Vec::new(),
+            no_mods: false,
+            layers: crate::pack::LayerOptions {
+                enabled: self.config.mods.enabled.clone(),
+                disabled: self.config.mods.disabled.clone(),
+                order: self.config.mods.order.clone(),
+            },
+            global_dirs: mod_dirs(),
+        };
+        let player_options = player::Options {
+            quick_turn: self.config.game.quick_turn,
+            tactical_reload: self.config.game.tactical_reload,
+        };
+        logging::write(&format!("play: {}", pack.path.display()));
+        let result = engine::run_root_with_display(
+            &pack.path,
+            None,
+            &save_dir,
+            &mods,
+            false,
+            self.config.language.as_deref(),
+            graphics,
+            player_options,
+            display,
+        );
+        match result {
+            Ok(()) => true,
+            Err(err) => {
+                logging::write(&format!("game failed: {err:#}"));
+                let mut software = graphics;
+                software.renderer = RendererKind::Software;
+                let _ = display.set_renderer(software);
+                self.show_message("GAME FAILED", &[&format!("{err:#}")], Screen::Play);
+                false
+            }
+        }
+    }
+
     /// Open the native folder picker for a manually installed copy.
     fn browse(&mut self, display: &Display) {
         if self.dialog.is_some() {
@@ -1315,6 +1732,7 @@ impl Launcher {
                 });
                 self.packs = scan_packs();
                 self.target = target_for(&self.packs);
+                self.refresh_mods();
                 self.screen = Screen::Main;
                 self.main_index = 0;
                 let title = if job.rebuild {
@@ -1349,7 +1767,7 @@ impl Launcher {
     }
 
     /// Turn a mouse click into the row it landed on and activate it.
-    fn click(&mut self, x: i32, y: i32, display: &Display) {
+    fn click(&mut self, x: i32, y: i32, display: &mut Display) {
         let x0 = self.grid.col_left(0);
         let x1 = x0 + self.grid.grid_width();
         if x < x0 || x >= x1 {
@@ -1408,7 +1826,25 @@ impl Launcher {
         loop {
             let dialog_changed = self.poll_dialog();
             let job_changed = self.poll_job();
-            if dialog_changed || job_changed || self.job.is_some() {
+            let update_changed = self.poll_update_job();
+            let check_changed = self.poll_check();
+            if self.auto_update
+                && !self.checking
+                && self.update_job.is_none()
+                && self.job.is_none()
+                && self.config.updates.available_version.is_some()
+            {
+                self.auto_update = false;
+                self.start_update();
+            }
+            if dialog_changed
+                || job_changed
+                || update_changed
+                || check_changed
+                || self.job.is_some()
+                || self.update_job.is_some()
+                || self.checking
+            {
                 dirty = true;
             }
             if dirty {
@@ -1434,6 +1870,9 @@ impl Launcher {
                     // worker; give it a moment to see the cancel flag before
                     // the process exits.
                     if let Some(job) = &self.job {
+                        job.cancel.store(true, Ordering::Relaxed);
+                    }
+                    if let Some(job) = &self.update_job {
                         job.cancel.store(true, Ordering::Relaxed);
                     }
                     let deadline = std::time::Instant::now() + Duration::from_secs(3);
@@ -1496,6 +1935,7 @@ impl Launcher {
 fn scan_packs() -> Vec<PackRow> {
     let roots = paths::data_roots();
     let custom = env::var_os(paths::DATA_ENV).is_some();
+    let source_hash = convert::packed_source_hash();
     let mut seen: HashSet<String> = HashSet::new();
     let mut packs = Vec::new();
     for (index, root) in roots.iter().enumerate() {
@@ -1539,10 +1979,10 @@ fn scan_packs() -> Vec<PackRow> {
                 .as_ref()
                 .and_then(|manifest| manifest.version.clone())
                 .unwrap_or_default();
-            let stale = manifest
-                .as_ref()
-                .and_then(|manifest| manifest.convert_version)
-                != Some(CONVERT_VERSION);
+            let stale = manifest.as_ref().is_none_or(|manifest| {
+                manifest.convert_version != Some(CONVERT_VERSION)
+                    || manifest.source_hash.as_deref() != Some(source_hash.as_str())
+            });
             packs.push(PackRow {
                 id,
                 name,
@@ -1565,6 +2005,126 @@ fn scan_packs() -> Vec<PackRow> {
             .then_with(|| a.file.cmp(&b.file))
     });
     packs
+}
+
+/// The extra mod directories scanned for every game, before the pack's own
+/// sibling `mods/` directory.
+fn mod_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = paths::data_roots()
+        .iter()
+        .map(|root| paths::mods_dir(root))
+        .collect();
+    let legacy = Config::default_mods_dir();
+    if !dirs.iter().any(|dir| dir == &legacy) {
+        dirs.push(legacy);
+    }
+    dirs
+}
+
+/// Discover the mods for `pack`, filtered to its base id and ordered by the
+/// config's explicit order then each manifest's load order.
+fn scan_mods(pack: Option<&PackRow>, config: &Config, dirs: &[PathBuf]) -> Vec<ModRow> {
+    let Some(pack) = pack else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::new();
+    let mut rows = Vec::new();
+    for path in modding::discover_mods(&pack.path, dirs) {
+        let manifest = match read_mod_manifest(&path) {
+            Ok(Some(manifest)) => manifest,
+            Ok(None) => continue,
+            Err(err) => {
+                logging::write(&format!("warning: mod {}: {err:#}", path.display()));
+                continue;
+            }
+        };
+        if manifest.kind != manifest::PackKind::Mod {
+            continue;
+        }
+        if manifest.base.as_deref() != Some(pack.id.as_str()) {
+            continue;
+        }
+        if !seen.insert(manifest.id.to_ascii_lowercase()) {
+            continue;
+        }
+        rows.push(ModRow {
+            enabled: mod_enabled(&config.mods, &manifest.id),
+            name: manifest.name.unwrap_or_else(|| manifest.id.clone()),
+            version: manifest.version.unwrap_or_default(),
+            load_order: manifest.load_order,
+            id: manifest.id,
+            path,
+        });
+    }
+    rows.sort_by(|a, b| {
+        let rank = |id: &str| {
+            config
+                .mods
+                .order
+                .iter()
+                .position(|ordered| ordered == id)
+                .unwrap_or(usize::MAX)
+        };
+        rank(&a.id)
+            .cmp(&rank(&b.id))
+            .then_with(|| a.load_order.cmp(&b.load_order))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    rows
+}
+
+/// Read a mod image's manifest, or a source directory's `manifest.toml`.
+fn read_mod_manifest(path: &Path) -> Result<Option<manifest::Manifest>> {
+    if path.is_dir() {
+        let file = path.join(manifest::ENTRY);
+        let text = fs::read_to_string(&file)
+            .with_context(|| format!("failed to read {}", file.display()))?;
+        return manifest::Manifest::parse(&text)
+            .map(Some)
+            .with_context(|| format!("invalid {}", file.display()));
+    }
+    pack::read_manifest(path)
+}
+
+fn mod_enabled(mods: &Mods, id: &str) -> bool {
+    if mods.disabled.iter().any(|disabled| disabled == id) {
+        return false;
+    }
+    mods.enabled
+        .as_ref()
+        .is_none_or(|enabled| enabled.iter().any(|listed| listed == id))
+}
+
+fn set_mod_enabled(mods: &mut Mods, id: &str, enabled: bool) {
+    mods.disabled.retain(|listed| listed != id);
+    if let Some(list) = &mut mods.enabled {
+        list.retain(|listed| listed != id);
+    }
+    if enabled {
+        if let Some(list) = &mut mods.enabled {
+            list.push(id.to_string());
+        }
+    } else {
+        mods.disabled.push(id.to_string());
+    }
+}
+
+/// Ask the desktop to open `path`.
+fn open_folder(path: &Path) {
+    let _ = fs::create_dir_all(path);
+    let command = if cfg!(windows) {
+        "explorer"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    if let Err(err) = std::process::Command::new(command).arg(path).spawn() {
+        logging::write(&format!(
+            "warning: could not open {}: {err}",
+            path.display()
+        ));
+    }
 }
 
 /// A short label for a data root in the pack table.
@@ -1625,6 +2185,13 @@ fn capture_size() -> Option<(u32, u32)> {
     (width > 0 && height > 0).then_some((width, height))
 }
 
+/// Unix seconds, for the update-check cache.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
 /// Move a selection index by `delta`, wrapping.
 fn step(index: &mut usize, len: usize, delta: isize) {
     if len == 0 {
@@ -1637,6 +2204,7 @@ fn step(index: &mut usize, len: usize, delta: isize) {
 /// Run the launcher. With `ARKLAY_LAUNCHER_CAPTURE` set it renders one frame
 /// to that BMP and exits, which is how the layout is previewed headlessly.
 pub fn run() -> Result<()> {
+    update::cleanup();
     let (config, warnings) = Config::load_default();
     for warning in warnings {
         logging::write(&format!("warning: {warning}"));
@@ -1657,11 +2225,22 @@ pub fn run() -> Result<()> {
         display.drawable_size()
     };
     let mut launcher = Launcher::new(&config, width, height)?;
+    launcher.clear_available_if_current();
+    launcher.maybe_start_check();
     // Headless checkpoints use this to exercise the install path without a
     // keyboard; it never runs for an ordinary launch.
     if capture.is_none() && env::var_os("ARKLAY_LAUNCHER_AUTOINSTALL").is_some() {
         launcher.screen = Screen::Install;
         launcher.install();
+    }
+    if capture.is_none() && env::var_os("ARKLAY_LAUNCHER_AUTOUPDATE").is_some() {
+        launcher.auto_update = true;
+        launcher.screen = Screen::Update;
+        launcher.update_index = 1;
+        launcher.start_check(true);
+    }
+    if capture.is_none() && env::var_os("ARKLAY_LAUNCHER_AUTOROLLBACK").is_some() {
+        launcher.rollback();
     }
     if let Some(path) = capture {
         if let Ok(name) = env::var("ARKLAY_LAUNCHER_SCREEN") {
@@ -1720,6 +2299,119 @@ mod tests {
         assert_eq!(progress_bar(0.5, 4), "[##--]");
         assert_eq!(progress_bar(1.0, 4), "[####]");
         assert_eq!(progress_bar(2.0, 4), "[####]");
+    }
+
+    #[test]
+    fn mods_are_filtered_by_base_and_ordered_by_config_then_load_order() {
+        use crate::manifest::{Manifest, PackKind};
+        use crate::pack::PackWriter;
+
+        let dir = std::env::temp_dir().join(format!("arklay-launcher-mods-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let games = dir.join("games");
+        let mods_dir = dir.join("mods");
+        fs::create_dir_all(&games).unwrap();
+        fs::create_dir_all(&mods_dir).unwrap();
+
+        let write_pack = |path: &Path, manifest: Manifest| {
+            let mut writer = PackWriter::new();
+            writer
+                .add(manifest::ENTRY, manifest.render().into_bytes())
+                .unwrap();
+            writer.write(path).unwrap();
+        };
+        let base = games.join("re1.akpak");
+        write_pack(&base, Manifest::base("re1"));
+        write_pack(
+            &mods_dir.join("hd.akpak"),
+            Manifest {
+                kind: PackKind::Mod,
+                base: Some("re1".to_string()),
+                name: Some("HD".to_string()),
+                load_order: 20,
+                ..Manifest::base("hd")
+            },
+        );
+        write_pack(
+            &mods_dir.join("early.akpak"),
+            Manifest {
+                kind: PackKind::Mod,
+                base: Some("re1".to_string()),
+                load_order: 5,
+                ..Manifest::base("early")
+            },
+        );
+        write_pack(
+            &mods_dir.join("other.akpak"),
+            Manifest {
+                kind: PackKind::Mod,
+                base: Some("re2".to_string()),
+                load_order: 1,
+                ..Manifest::base("other")
+            },
+        );
+        let demo = mods_dir.join("demo");
+        fs::create_dir_all(&demo).unwrap();
+        fs::write(
+            demo.join(manifest::ENTRY),
+            Manifest {
+                kind: PackKind::Mod,
+                base: Some("re1".to_string()),
+                name: Some("Demo reels".to_string()),
+                load_order: 10,
+                ..Manifest::base("demo")
+            }
+            .render(),
+        )
+        .unwrap();
+
+        let pack = PackRow {
+            id: "re1".to_string(),
+            name: "Resident Evil".to_string(),
+            file: "re1.akpak".to_string(),
+            version: "0.1.0".to_string(),
+            source: "LOCAL".to_string(),
+            path: base,
+            stale: false,
+            error: None,
+        };
+        let config = Config::default();
+        let rows = scan_mods(Some(&pack), &config, std::slice::from_ref(&mods_dir));
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["early", "demo", "hd"]
+        );
+
+        let mut config = Config::default();
+        config.mods.order = vec!["hd".to_string()];
+        let rows = scan_mods(Some(&pack), &config, std::slice::from_ref(&mods_dir));
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["hd", "early", "demo"]
+        );
+
+        let mut mods = Mods::default();
+        assert!(mod_enabled(&mods, "hd"));
+        set_mod_enabled(&mut mods, "hd", false);
+        assert!(!mod_enabled(&mods, "hd"));
+        set_mod_enabled(&mut mods, "hd", true);
+        assert!(mod_enabled(&mods, "hd"));
+        assert!(mods.disabled.is_empty());
+        let mut mods = Mods {
+            enabled: Some(vec!["early".to_string()]),
+            ..Mods::default()
+        };
+        assert!(!mod_enabled(&mods, "hd"));
+        set_mod_enabled(&mut mods, "hd", true);
+        assert_eq!(
+            mods.enabled.as_deref(),
+            Some(["early".to_string(), "hd".to_string()].as_slice())
+        );
+        set_mod_enabled(&mut mods, "early", false);
+        assert_eq!(mods.disabled, vec!["early".to_string()]);
+        assert_eq!(mods.enabled.as_deref(), Some(["hd".to_string()].as_slice()));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

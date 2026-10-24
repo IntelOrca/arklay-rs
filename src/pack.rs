@@ -892,10 +892,19 @@ impl Pack {
             if let Some(declared) = &manifest.base
                 && declared != &base_id
             {
-                bail!(
-                    "mod {} declares base \"{declared}\" but the base pack declares \"{base_id}\"",
+                // A shared mods folder holds every game's mods; an explicit
+                // --mod naming the wrong base is still a hard error.
+                if layer.explicit {
+                    bail!(
+                        "mod {} declares base \"{declared}\" but the base pack declares \"{base_id}\"",
+                        path.display()
+                    );
+                }
+                warnings.push(format!(
+                    "skipping mod {} for base \"{declared}\" (this pack is \"{base_id}\")",
                     path.display()
-                );
+                ));
+                continue;
             }
             discovered_ids.insert(manifest.id.clone());
             if !layer.explicit && !options.allows(&manifest.id) {
@@ -2249,6 +2258,7 @@ mod tests {
             language: None,
             engine: None,
             convert_version: None,
+            source_hash: None,
             lua: Vec::new(),
         }
         .render()
