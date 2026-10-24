@@ -160,6 +160,11 @@ impl Grid {
         self.draw(frame, row, col, value, color);
     }
 
+    fn draw_centered(&mut self, frame: &mut Frame, row: usize, value: &str, color: Color) {
+        let col = text::COLS.saturating_sub(value.chars().count()) / 2;
+        self.draw(frame, row, col, value, color);
+    }
+
     fn bar(&self, frame: &mut Frame, row: usize, color: Color) {
         fill_rect(
             frame,
@@ -855,16 +860,7 @@ impl Launcher {
     fn draw_mods(&mut self) {
         self.grid
             .draw(&mut self.frame, 3, 4, "MODS - RESIDENT EVIL", Color::BODY);
-        self.table_header(
-            5,
-            &[
-                (4, "PRIORITY"),
-                (14, "ON"),
-                (18, "MOD"),
-                (46, "ID"),
-                (68, "VERSION"),
-            ],
-        );
+        self.table_header(5, &[(4, "ON"), (9, "MOD"), (46, "ID"), (68, "VERSION")]);
         if self.mods.is_empty() {
             self.grid
                 .draw(&mut self.frame, 7, 4, "NO MODS DISCOVERED.", Color::DIM);
@@ -883,39 +879,37 @@ impl Launcher {
         }
         let mods = self.mods.clone();
         let total = mods.len();
+        if total == 1 {
+            self.grid
+                .draw_centered(&mut self.frame, 6, "-- ONLY MOD --", Color::DIM);
+        } else {
+            self.grid
+                .draw_centered(&mut self.frame, 6, "-- LOW PRIORITY --", Color::DIM);
+        }
         for (index, row) in mods.iter().enumerate() {
             let line = 7 + index;
             let selected = index == self.mods_index;
             let mark = if row.enabled { "[x]" } else { "[ ]" };
-            let priority = if total == 1 {
-                "ONLY"
-            } else if index == 0 {
-                "LOWEST"
-            } else if index + 1 == total {
-                "HIGHEST"
-            } else {
-                "MID"
-            };
             self.table_row(
                 line,
                 selected,
                 &[
-                    (4, priority),
-                    (14, mark),
-                    (18, &truncate(&row.name, 27)),
+                    (4, mark),
+                    (9, &truncate(&row.name, 34)),
                     (46, &truncate(&row.id, 20)),
                     (68, &truncate(&row.version, 9)),
                 ],
             );
             self.hits.push((line, index));
         }
-        self.grid.draw(
-            &mut self.frame,
-            19,
-            4,
-            "APPLIED TOP TO BOTTOM: LOWEST PRIORITY FIRST, HIGHEST LAST.",
-            Color::DIM,
-        );
+        if total > 1 {
+            self.grid.draw_centered(
+                &mut self.frame,
+                7 + total,
+                "-- HIGH PRIORITY --",
+                Color::DIM,
+            );
+        }
         if let Some(row) = self.mods.get(self.mods_index) {
             self.grid.draw(
                 &mut self.frame,
