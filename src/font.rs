@@ -13,7 +13,10 @@
 //! (0x00455520) ASCII-buffer renderer, whose 40/41 are `(` and `)` and are
 //! remapped to the sheet's round parentheses; see its own note.
 
-use crate::model::Texture8;
+use std::sync::Arc;
+
+use crate::htexture::Replacement;
+use crate::model::{PALETTE_ROW_LEN, Texture8};
 use crate::pack::{AssetClass, Pack};
 use crate::render::{Framebuffer, SpriteDraw};
 
@@ -24,15 +27,20 @@ pub const GLYPH_HEIGHT: i32 = 14;
 /// Width at which a sheet selects the 14px Japanese metrics.
 pub const JPN_SHEET_WIDTH: u32 = 768;
 
-/// The default sheet entry: whatever font the converted install ships, the
-/// Japanese `FONT.TIM` or the Western `fontus.tim`.
+/// The default sheet entry: the Japanese `FONT.TIM` when the converted
+/// install ships it, otherwise [`WESTERN_SHEET`].
 pub const DEFAULT_ENTRY: &str = "font/font.tim";
 /// The Japanese sheet as a script-specific override, packed when the install
 /// carries a Western default too.
 pub const JAPANESE_ENTRY: &str = "font/jpn.tim";
-/// The Western sheet as a script-specific override, packed when the install
-/// carries a Japanese default.
+/// The Western sheet as a script-specific override: always
+/// [`WESTERN_SHEET`].
 pub const LATIN_ENTRY: &str = "font/latin.tim";
+/// Classic REbirth's Western sheet (its `DATA/PBFONT0.TIM`), which every
+/// pack carries as [`LATIN_ENTRY`]: the Japanese sheet's 14px cells with the
+/// kana replaced by accented Latin, drawn at CR's proportional advances. HD
+/// packs made for CR replace this sheet, not the releases' `fontus.tim`.
+pub const WESTERN_SHEET: &[u8] = include_bytes!("../games/re1/font/latin.tim");
 /// The default sheet's pack stem, the key a replacement resolves by.
 pub const DEFAULT_STEM: &str = "font/font";
 
@@ -59,7 +67,17 @@ pub fn load_session(pack: &Pack, script: crate::charset::Script) -> Option<Font>
     let stem = session_entry(pack, script);
     let asset = pack.read_asset(stem, AssetClass::Image).ok().flatten()?;
     match crate::assets::decode_texture(&asset, crate::assets::Geometry::Shipped) {
-        Ok(texture) => Some(Font::new(texture)),
+        Ok(texture) => {
+            let mut font = Font::new(texture);
+            if !pack.htexture().is_empty() {
+                let candidates = crate::htexture::font_candidates(&font.texture);
+                font.hd = crate::htexture::replacement(pack, &candidates, || {
+                    format!("{stem} glyph page")
+                })
+                .map(HdGlyphs::new);
+            }
+            Some(font)
+        }
         Err(err) => {
             eprintln!("warning: invalid {}: {err:#}", asset.path());
             None
@@ -71,8 +89,12 @@ pub fn load_session(pack: &Pack, script: crate::charset::Script) -> Option<Font>
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FontMetrics {
     /// Glyph advance: 14 for the 768-wide Japanese sheet, 8 for the 256-wide
-    /// USA sheet.
+    /// Western sheet (the original's `fontus.tim` pitch, which Classic
+    /// REbirth's sheet keeps as its default advance).
     pub glyph_w: i32,
+    /// The sheet's cell pitch: 14 on both sheets. Classic REbirth's Western
+    /// sheet lays its glyphs out in the Japanese sheet's cells.
+    pub cell_w: i32,
     /// Left margin of a message box.
     pub left_margin: i32,
     /// Room-message y.
@@ -83,12 +105,14 @@ pub struct FontMetrics {
 
 impl FontMetrics {
     /// Select the metrics from the sheet width: 768-wide selects 14px glyphs
-    /// with margin `0x22`; anything narrower uses the USA 8px metrics with
-    /// margin `0x30`. Both share the room-message y `181` and menu y `186`.
+    /// with margin `0x22`; anything narrower is Classic REbirth's Western
+    /// sheet, 14px cells laid out at the USA 8px metrics with margin `0x30`.
+    /// Both share the room-message y `181` and menu y `186`.
     pub fn from_sheet_width(width: u32) -> Self {
         if width >= JPN_SHEET_WIDTH {
             Self {
                 glyph_w: 14,
+                cell_w: 14,
                 left_margin: 0x22,
                 text_y: 181,
                 menu_y: 186,
@@ -96,6 +120,7 @@ impl FontMetrics {
         } else {
             Self {
                 glyph_w: 8,
+                cell_w: 14,
                 left_margin: 0x30,
                 text_y: 181,
                 menu_y: 186,
@@ -186,6 +211,31 @@ impl GlyphTable {
             }
         }
         table.apply_authored_rules();
+        table
+    }
+
+    /// Classic REbirth's proportional metrics for its Western sheet: every
+    /// plain cell advances the default 8px but for the cells
+    /// [`crate::charset::western_widths`] lists. The digits keep the default,
+    /// so counters stay monospaced.
+    pub fn western(texture: &Texture8, metrics: FontMetrics) -> Self {
+        let rows = (texture.height as i32 / GLYPH_HEIGHT).max(0) as usize;
+        let full = GlyphMetric::full(metrics.glyph_w);
+        let mut table = Self {
+            glyph_w: metrics.glyph_w,
+            pages: [vec![full; rows * PAGE_COLUMNS], Vec::new()],
+        };
+        for &(byte, width, indent) in crate::charset::western_widths() {
+            table.set(
+                0,
+                plain_row(byte),
+                plain_col(byte),
+                GlyphMetric {
+                    indent: i32::from(indent),
+                    advance: i32::from(width),
+                },
+            );
+        }
         table
     }
 
@@ -402,7 +452,7 @@ impl<'a> Glyphs<'a> {
     /// one is selected, else the full cell.
     fn metric(&self, u: i32, v: i32) -> GlyphMetric {
         match self.table {
-            Some(table) => table.at(u, v, self.metrics.glyph_w),
+            Some(table) => table.at(u, v, self.metrics.cell_w),
             None => GlyphMetric::full(self.metrics.glyph_w),
         }
     }
@@ -412,7 +462,7 @@ impl<'a> Glyphs<'a> {
         Glyph {
             u,
             v,
-            width: self.metrics.glyph_w,
+            width: self.metrics.cell_w,
             height: GLYPH_HEIGHT,
             advance: metric.advance,
             missing: false,
@@ -482,7 +532,7 @@ impl Iterator for Glyphs<'_> {
                         0xF9 => (256, row * GLYPH_HEIGHT),
                         _ => (256, (row + 14) * GLYPH_HEIGHT),
                     };
-                    return Some(self.glyph(page + col * self.metrics.glyph_w, v));
+                    return Some(self.glyph(page + col * self.metrics.cell_w, v));
                 }
                 _ => {
                     self.position += 1;
@@ -500,12 +550,19 @@ impl Glyphs<'_> {
         // The original's `PrintText8x14` — which reads an ASCII buffer, not
         // the game-text encoding — draws ASCII '(' and ')' as the sheet's
         // round parentheses. Only the ASCII grid sets the flag.
+        // The Western sheet keeps them in the plain grid's 0x05/0x06 cells.
         if self.remap_parentheses {
+            let western = self.metrics.glyph_w < self.metrics.cell_w;
+            let cells = if western {
+                [(5 * self.metrics.cell_w, 28), (6 * self.metrics.cell_w, 28)]
+            } else {
+                [(56, 224), (70, 224)]
+            };
             if byte == 0x28 {
-                return self.glyph(56, 224);
+                return self.glyph(cells[0].0, cells[0].1);
             }
             if byte == 0x29 {
-                return self.glyph(70, 224);
+                return self.glyph(cells[1].0, cells[1].1);
             }
         }
         let byte = i32::from(byte);
@@ -516,7 +573,7 @@ impl Glyphs<'_> {
         } else {
             0
         };
-        self.glyph(col * self.metrics.glyph_w, bias + row * GLYPH_HEIGHT)
+        self.glyph(col * self.metrics.cell_w, bias + row * GLYPH_HEIGHT)
     }
 }
 
@@ -531,6 +588,8 @@ pub struct Font {
     missing: Texture8,
     /// The tight per-glyph metrics measured from the sheet's ink.
     pub glyph_table: GlyphTable,
+    /// The HD replacement of the sheet's glyph page, when the pack has one.
+    pub hd: Option<HdGlyphs>,
 }
 
 impl Font {
@@ -541,12 +600,17 @@ impl Font {
     pub fn new(texture: Texture8) -> Self {
         let metrics = FontMetrics::from_sheet_width(texture.width);
         let missing = missing_box_texture(&texture, metrics.glyph_w);
-        let glyph_table = GlyphTable::measure(&texture, metrics.glyph_w);
+        let glyph_table = if texture.width >= JPN_SHEET_WIDTH {
+            GlyphTable::measure(&texture, metrics.cell_w)
+        } else {
+            GlyphTable::western(&texture, metrics)
+        };
         Self {
             texture,
             metrics,
             missing,
             glyph_table,
+            hd: None,
         }
     }
 
@@ -566,9 +630,9 @@ impl Font {
     fn glyphs<'a>(&'a self, tight: bool, bytes: &'a [u8]) -> Glyphs<'a> {
         let glyphs = Glyphs::new(bytes, self.metrics);
         // The tight table compensates for the Japanese sheet's full-width
-        // Latin glyphs. The Western sheet was drawn at its own 8px advances
-        // by the original, so it ignores the flag and every cell is whole.
-        if tight && self.script() == crate::charset::Script::Japanese {
+        // Latin glyphs. The Western sheet always draws at Classic REbirth's
+        // proportional advances, which its table carries.
+        if tight || self.script() == crate::charset::Script::Latin {
             glyphs.tight(&self.glyph_table)
         } else {
             glyphs
@@ -662,18 +726,76 @@ impl Font {
         let mut cursor = x;
         for glyph in Glyphs::text_8x14(bytes, self.metrics) {
             if glyph.visible() {
-                sprites.push(SpriteDraw::indexed(
-                    &self.texture,
-                    [glyph.u, glyph.v, glyph.width, glyph.height],
-                    [cursor, y, glyph.width, glyph.height],
-                    0,
-                    0,
-                    tint,
-                ));
+                let dst = [cursor, y, glyph.width, glyph.height];
+                self.queue_glyph(framebuffer, &mut sprites, glyph, dst, 0, tint);
             }
             cursor += glyph.advance;
         }
         framebuffer.draw_sprites(&mut sprites);
+    }
+
+    /// Queue one visible glyph drawn into `dst`, or draw it at once as an HD
+    /// quad when the frame captures replacements and the sheet's HD page
+    /// covers the cell. The replaced draw punches the HD glyph's own
+    /// coverage, so the HD page's letter shapes show whole even where they
+    /// differ from the sheet's.
+    fn queue_glyph<'a>(
+        &'a self,
+        framebuffer: &mut Framebuffer,
+        sprites: &mut Vec<SpriteDraw<'a>>,
+        glyph: Glyph,
+        dst: [i32; 4],
+        brightness: u8,
+        tint: Tint,
+    ) {
+        let src = [glyph.u, glyph.v, glyph.width, glyph.height];
+        if glyph.missing {
+            sprites.push(SpriteDraw::indexed(
+                &self.missing,
+                src,
+                dst,
+                0,
+                brightness,
+                tint,
+            ));
+            return;
+        }
+        let hd = self.hd.as_ref().filter(|hd| {
+            framebuffer.captures_hd() && hd.covers(src, self.metrics.glyph_w, self.script())
+        });
+        let Some(hd) = hd else {
+            sprites.push(SpriteDraw::indexed(
+                &self.texture,
+                src,
+                dst,
+                0,
+                brightness,
+                tint,
+            ));
+            return;
+        };
+        let [fw, fh] = hd.art.frame.map(|v| v as f32);
+        let [sx, sy, sw, sh] = src.map(|v| v as f32);
+        let [dx, dy, dw, dh] = dst.map(|v| v as f32);
+        let uv = [sx / fw, sy / fh, (sx + sw) / fw, (sy + sh) / fh];
+        let scale = f32::from(crate::render::brightness_scale(brightness)) / 255.0;
+        let colour = tint.rgb().map(|channel| f32::from(channel) / 255.0 * scale);
+        framebuffer.draw_replaced(
+            hd.art.clone(),
+            [dx, dy, dx + dw, dy + dh],
+            uv,
+            colour,
+            |framebuffer| {
+                framebuffer.draw_sprites(&mut [SpriteDraw::indexed(
+                    &hd.coverage,
+                    src,
+                    dst,
+                    0,
+                    brightness,
+                    tint,
+                )]);
+            },
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -711,24 +833,83 @@ impl Font {
                 } else {
                     glyph.width
                 };
-                let src = [glyph.u, glyph.v, glyph.width, glyph.height];
-                let texture = if glyph.missing {
-                    &self.missing
-                } else {
-                    &self.texture
-                };
-                sprites.push(SpriteDraw::indexed(
-                    texture,
-                    src,
-                    [left, y, width, glyph.height],
-                    0,
-                    brightness,
-                    tint,
-                ));
+                let dst = [left, y, width, glyph.height];
+                self.queue_glyph(framebuffer, &mut sprites, glyph, dst, brightness, tint);
             }
             cursor += glyph.advance;
         }
         framebuffer.draw_sprites(&mut sprites);
+    }
+}
+
+/// A font sheet's HD glyph page and the source-resolution mask a replaced
+/// glyph punches.
+#[derive(Debug, Clone)]
+pub struct HdGlyphs {
+    /// The HD image of the sheet's left 256 x 256 page.
+    pub art: Arc<Replacement>,
+    /// Index 1 wherever any HD texel over the source texel shows, so the
+    /// overlay keeps the HD letter's whole shape rather than the sheet's.
+    coverage: Texture8,
+}
+
+/// The Japanese sheet's hiragana block, `[row, first column]` ranges of the
+/// left page: rows 7 to 10 and the first three cells of row 11. Classic
+/// REbirth's Western page, which HD packs replace, holds accented Latin
+/// there, so those cells keep drawing from the sheet.
+const HIRAGANA_ROWS: std::ops::RangeInclusive<i32> = 7..=10;
+const HIRAGANA_TAIL: (i32, i32) = (11, 3);
+
+impl HdGlyphs {
+    pub fn new(art: Arc<Replacement>) -> Self {
+        let [width, height] = art.frame;
+        let image = &art.image;
+        let mut indices = vec![0u8; (width * height) as usize];
+        for y in 0..height {
+            let rows = (y * image.height / height)..((y + 1) * image.height / height);
+            for x in 0..width {
+                let columns = (x * image.width / width)..((x + 1) * image.width / width);
+                let shows = rows.clone().any(|row| {
+                    columns.clone().any(|column| {
+                        let offset = (row * image.width + column) as usize * 4 + 3;
+                        image.rgba.get(offset).is_some_and(|&alpha| alpha > 0)
+                    })
+                });
+                if shows {
+                    indices[(y * width + x) as usize] = 1;
+                }
+            }
+        }
+        let mut palettes = vec![[0u8; 4]; PALETTE_ROW_LEN];
+        palettes[1] = [255; 4];
+        Self {
+            art,
+            coverage: Texture8 {
+                width,
+                height,
+                indices,
+                palettes,
+                stp: Vec::new(),
+            },
+        }
+    }
+
+    /// Whether the sheet cell `src` (`[u, v, w, h]`), on a sheet of
+    /// `glyph_w`-wide cells, draws from the HD page.
+    fn covers(&self, src: [i32; 4], glyph_w: i32, script: crate::charset::Script) -> bool {
+        let [u, v, w, h] = src;
+        let [width, height] = self.art.frame.map(|v| v as i32);
+        if u < 0 || v < 0 || u + w > width || v + h > height {
+            return false;
+        }
+        if script == crate::charset::Script::Japanese {
+            let (row, column) = (v / GLYPH_HEIGHT, u / glyph_w.max(1));
+            let (tail_row, tail_columns) = HIRAGANA_TAIL;
+            if HIRAGANA_ROWS.contains(&row) || (row == tail_row && column < tail_columns) {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -1250,14 +1431,16 @@ mod tests {
     }
 
     #[test]
-    fn usa_extended_glyphs_use_eight_pixel_columns() {
+    fn western_glyphs_sit_in_fourteen_pixel_cells() {
+        // Classic REbirth's sheet keeps the Japanese 14px grid; only the
+        // advance is narrower.
         let f8 = steps(&[0xF8, 20], metrics_usa());
-        assert_eq!(f8[0].u, 16);
+        assert_eq!(f8[0].u, 28);
         assert_eq!(f8[0].v, 224);
-        assert_eq!(f8[0].width, 8);
+        assert_eq!(f8[0].width, 14);
 
         let plain = steps(&[0x1D], metrics_usa());
-        assert_eq!(plain[0].u, 88);
+        assert_eq!(plain[0].u, 11 * 14);
         assert_eq!(plain[0].v, 42);
     }
 
@@ -1314,33 +1497,28 @@ mod tests {
     }
 
     #[test]
-    fn the_western_sheet_ignores_the_tight_flag() {
+    fn the_western_sheet_uses_classic_rebirths_widths() {
         // The tight table compensates for the Japanese sheet's full-width
-        // Latin glyphs. The Western sheet was drawn whole by the original, so
-        // a narrow cell keeps its 8px advance even when the language asks for
-        // tight metrics (issue #32).
-        let width = 256u32;
-        let height = 256u32;
-        let mut indices = vec![0u8; (width * height) as usize];
-        // `I` is plain cell 0x25: row 2, column 1 -> u 8, v 28 + 2*14.
-        for y in 56..56 + GLYPH_HEIGHT {
-            for x in 10..=12 {
-                indices[(y as u32 * width + x as u32) as usize] = 1;
-            }
-        }
-        let mut palettes = vec![[0u8; 4]; crate::model::PALETTE_ROW_LEN];
-        palettes[1] = [255, 255, 255, 255];
+        // Latin glyphs. The Western sheet's advances come from Classic
+        // REbirth's width table instead, whatever the tight flag says, and
+        // never from the ink (issue #32, #63).
         let font = Font::new(Texture8 {
-            width,
-            height,
-            indices,
-            palettes,
+            width: 256,
+            height: 256,
+            indices: vec![0; 256 * 256],
+            palettes: vec![[0u8; 4]; crate::model::PALETTE_ROW_LEN],
             stp: Vec::new(),
         });
         assert_eq!(font.script(), crate::charset::Script::Latin);
         assert_eq!(font.metrics.glyph_w, 8);
-        assert_eq!(font.advance(true, &[0x25]), 8, "the Western sheet is whole");
-        assert_eq!(font.advance(false, &[0x25]), 8);
+        // `I` is plain cell 0x25: CR draws it 2px left and advances 5.
+        assert_eq!(font.advance(true, &[0x25]), 5);
+        assert_eq!(font.advance(false, &[0x25]), 5);
+        let i: Vec<Glyph> = font.glyphs(false, &[0x25]).collect();
+        assert_eq!((i[0].u, i[0].v), (14, 56));
+        assert_eq!(i[0].indent, 2);
+        // `A` (0x1D) keeps the default 8px advance.
+        assert_eq!(font.advance(false, &[0x1D]), 8);
 
         // The same strip on the Japanese sheet is trimmed to its ink.
         let jpn = Font::new(sheet_with_ink(&[(14, 56, 2, 4)]));
@@ -1603,5 +1781,77 @@ mod tests {
         };
         assert!(shaded(154, 28) > 0, "the sheet's 0x0B arrow cell is blank");
         assert_eq!(shaded(326, 238), 0, "the sheet's 0xFA 0x3B cell is inked");
+    }
+
+    /// HD glyphs over a `frame`-sized page from a 4x image whose texels
+    /// show (alpha 255) where `shows(x, y)` holds.
+    fn hd_glyphs(frame: [u32; 2], shows: impl Fn(u32, u32) -> bool) -> HdGlyphs {
+        let [width, height] = frame.map(|v| v * 4);
+        let rgba = (0..width * height)
+            .flat_map(|i| {
+                let alpha = if shows(i % width, i / width) { 255 } else { 0 };
+                [255, 255, 255, alpha]
+            })
+            .collect();
+        HdGlyphs::new(Arc::new(Replacement {
+            image: crate::state::Image {
+                width,
+                height,
+                rgba,
+            },
+            frame,
+        }))
+    }
+
+    #[test]
+    fn hd_coverage_marks_every_source_texel_any_hd_texel_shows_over() {
+        let hd = hd_glyphs([4, 2], |x, y| (x, y) == (5, 3) || (x, y) == (15, 7));
+        assert_eq!(hd.coverage.indices, [0, 1, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(hd.coverage.palettes[1], [255; 4]);
+    }
+
+    #[test]
+    fn hd_glyphs_skip_the_japanese_hiragana_block() {
+        use crate::charset::Script;
+        let hd = hd_glyphs([256, 256], |_, _| true);
+        let cell = |column: i32, row: i32| [column * 14, row * GLYPH_HEIGHT, 14, GLYPH_HEIGHT];
+        assert!(hd.covers(cell(0, 6), 14, Script::Japanese));
+        assert!(!hd.covers(cell(0, 7), 14, Script::Japanese));
+        assert!(!hd.covers(cell(17, 10), 14, Script::Japanese));
+        assert!(!hd.covers(cell(2, 11), 14, Script::Japanese));
+        assert!(hd.covers(cell(3, 11), 14, Script::Japanese));
+        assert!(hd.covers(cell(0, 7), 14, Script::Latin));
+        // Cells past the page draw from the sheet.
+        assert!(!hd.covers(cell(18, 0), 14, Script::Japanese));
+        assert!(!hd.covers([250, 0, 14, GLYPH_HEIGHT], 14, Script::Latin));
+    }
+
+    #[test]
+    fn a_captured_frame_draws_covered_glyphs_as_hd_quads() {
+        let probe = Font::new(sheet_with_ink(&[]));
+        let glyph = steps(b"\x20", probe.metrics)[0];
+        let mut font = Font::new(sheet_with_ink(&[(glyph.u, glyph.v, 0, 13)]));
+        font.hd = Some(hd_glyphs([256, 256], |_, _| true));
+        let glyph = font.glyphs(false, b"\x20").next().unwrap();
+        assert!(glyph.visible());
+
+        let tint = Tint::Rgb(255, 128, 0);
+        let mut plain = Framebuffer::new();
+        font.draw_text(&mut plain, 10, 20, tint, 0, b"\x20", false);
+        assert!(plain.hd_quads().is_empty());
+
+        let mut framebuffer = Framebuffer::new();
+        framebuffer.capture_hd(0);
+        font.draw_text(&mut framebuffer, 10, 20, tint, 0, b"\x20", false);
+        let quads = framebuffer.hd_quads();
+        assert_eq!(quads.len(), 1);
+        let [u, v, w, h] = [glyph.u, glyph.v, glyph.width, glyph.height].map(|v| v as f32);
+        assert_eq!(quads[0].dst, [10.0, 20.0, 10.0 + w, 20.0 + h]);
+        assert_eq!(
+            quads[0].uv,
+            [u / 256.0, v / 256.0, (u + w) / 256.0, (v + h) / 256.0]
+        );
+        let scale = f32::from(crate::render::brightness_scale(0)) / 255.0;
+        assert_eq!(quads[0].colour, [1.0 * scale, 128.0 / 255.0 * scale, 0.0]);
     }
 }

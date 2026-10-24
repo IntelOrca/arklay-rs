@@ -393,10 +393,11 @@ fn light(table: &Table) -> mlua::Result<EntityLight> {
     })
 }
 
-/// Draw `bytes` through the font sheet's own grid addressing: `u = (c % 18)
-/// * glyph_w`, `v = (c / 18) * 14`, no header offset (the reference's
-/// `ending_draw_text`, `EndingScreen.cpp:296-324`). The bytes are raw sheet
-/// cells, so a `0x5E` lands on the sheet's own separator cell.
+/// Draw `bytes` through the font sheet's own grid addressing:
+/// `u = (c % 18) * cell_w`, `v = (c / 18) * 14`, no header offset, advancing
+/// `glyph_w` (the reference's `ending_draw_text`, `EndingScreen.cpp:296-324`). The
+/// bytes are raw sheet cells, so a `0x5E` lands on the sheet's own separator
+/// cell.
 fn draw_grid_text(
     framebuffer: &mut Framebuffer,
     font: &crate::font::Font,
@@ -405,18 +406,19 @@ fn draw_grid_text(
     bytes: &[u8],
 ) {
     let glyph_w = font.metrics.glyph_w;
+    let cell_w = font.metrics.cell_w;
     if glyph_w <= 0 {
         return;
     }
     let [mut pen, y] = origin;
     for &byte in bytes {
         if byte != b' ' {
-            let u = i32::from(byte % 18) * glyph_w;
+            let u = i32::from(byte % 18) * cell_w;
             let v = i32::from(byte / 18) * GLYPH_HEIGHT;
             framebuffer.draw_indexed_sprite_scaled(
                 &font.texture,
-                [u, v, glyph_w, GLYPH_HEIGHT],
-                [pen, y, glyph_w, GLYPH_HEIGHT],
+                [u, v, cell_w, GLYPH_HEIGHT],
+                [pen, y, cell_w, GLYPH_HEIGHT],
                 0,
                 scale,
                 Tint::White,

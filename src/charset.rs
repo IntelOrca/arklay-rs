@@ -8,10 +8,11 @@
 //! map (`FONT.TIM`) that `font.rs` was verified against, so encoding and
 //! rendering always agree.
 //!
-//! Two sheets ship with the games and each assigns the bytes its own way: the
-//! 768-wide Japanese `FONT.TIM` (14px cells, kana through the extended pages)
-//! and the 256-wide Western `fontus.tim` (8px cells, accented Latin letters
-//! and the European punctuation). [`Script`] selects the map; a pack's font
+//! Two sheets assign the bytes each their own way: the 768-wide Japanese
+//! `FONT.TIM` (14px cells, kana through the extended pages) and the 256-wide
+//! Western sheet every pack carries, Classic REbirth's `PBFONT0.TIM` (the
+//! Japanese 14px cells with accented Latin letters and the European
+//! punctuation in place of the kana). [`Script`] selects the map; a pack's font
 //! sheet selects the script by its width, so the language files, the message
 //! streams and the font always agree (see [`crate::text::Text`]).
 //!
@@ -58,8 +59,9 @@ pub enum Script {
     /// kanji through the `0xF8`/`0xF9`/`0xFA` pages.
     #[default]
     Japanese,
-    /// The 256-wide Western sheet (`Data/fontus.tim`): 8px cells with the
-    /// accented Latin letters and the European punctuation, all plain cells.
+    /// The 256-wide Western sheet (Classic REbirth's `PBFONT0.TIM`): 14px
+    /// cells drawn at proportional advances, with the accented Latin letters
+    /// and the European punctuation, all plain cells.
     Latin,
 }
 
@@ -218,6 +220,13 @@ pub fn decode(bytes: &[u8], script: Script, out: &mut String) {
             }
         }
     }
+}
+
+/// Classic REbirth's `(byte, width, indent)` for the Western sheet's plain
+/// cells whose advance is not the default 8px: the cell draws `indent`
+/// pixels left of the cursor, which then advances by `width`.
+pub fn western_widths() -> &'static [(u8, u8, u8)] {
+    &latin::WIDTHS
 }
 
 /// The cell a plain glyph byte (`0x0C..=0xF7`) selects.
@@ -487,9 +496,11 @@ mod tests {
         assert_eq!(plain_cell(0xFF, Script::Japanese), None); // beyond the grid
         assert_eq!(plain_cell(0x09, Script::Japanese), None); // an unnamed cell
         assert_eq!(plain_cell(0x18, Script::Latin), Some(","));
-        assert_eq!(plain_cell(0x37, Script::Latin), Some("("));
+        assert_eq!(plain_cell(0x05, Script::Latin), Some("("));
+        assert_eq!(plain_cell(0x37, Script::Latin), Some("["));
         assert_eq!(plain_cell(0x65, Script::Latin), Some("é"));
-        assert_eq!(plain_cell(0x90, Script::Latin), None); // a symbol row
+        assert_eq!(plain_cell(0x84, Script::Latin), Some("Ñ"));
+        assert_eq!(plain_cell(0x80, Script::Latin), None); // a fill piece
         assert_eq!(plain_cell(0xFF, Script::Latin), None);
     }
 
@@ -568,9 +579,9 @@ mod tests {
     }
 
     #[test]
-    fn latin_spells_the_slash_as_its_backslash_cell() {
-        // The Western sheet has no `/` cell; the USA save screen's separators
-        // are its backslash, so the substitute keeps localized text readable.
+    fn latin_spells_the_backslash_as_the_slash_cell() {
+        // Classic REbirth's sheet draws `/` where the USA font had `\`, and
+        // has no backslash of its own, so a backslash reads as the slash.
         assert_eq!(latin("/"), latin("\\"));
         assert_eq!(latin("/"), [0x38]);
         assert_eq!(latin("10/18"), latin("10\\18"));
@@ -586,7 +597,8 @@ mod tests {
         // The Japanese sheet spells both comma and semicolon as its
         // ideographic comma.
         assert_eq!(encoded(";"), [0x17]);
-        assert_eq!(latin("("), [0x37]);
+        assert_eq!(latin("("), [0x05]);
+        assert_eq!(latin("["), [0x37]);
         assert_eq!(encoded("("), [0xF8, 0x16]);
         // The Western sheet spells `+` and `=` where the Japanese one cannot.
         assert_eq!(latin("+"), [0x7D]);
@@ -602,10 +614,12 @@ mod tests {
 
     #[test]
     fn latin_marks_what_the_western_sheet_cannot_spell() {
-        // The original European releases' font has no Nordic, Iberian or
-        // Cyrillic letters: those read as the missing-glyph box.
-        assert_eq!(latin("ñ"), MISSING);
-        assert_eq!(latin("å"), MISSING);
+        // Classic REbirth's sheet adds the Iberian and Nordic letters the
+        // original European font lacked; Cyrillic still reads as the box.
+        assert_eq!(latin("Ñ"), [0x84]);
+        assert_eq!(latin("ñ"), [0x85]);
+        assert_eq!(latin("å"), [0xA3]);
+        assert_eq!(latin("¿¡"), [0x92, 0x93]);
         assert_eq!(latin("З"), MISSING);
         assert_eq!(latin("café"), [0x3F, 0x3D, 0x42, 0x65]);
         assert_eq!(latin("naïve"), [0x4A, 0x3D, 0x69, 0x52, 0x41]);
