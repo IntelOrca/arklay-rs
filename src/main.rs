@@ -1,3 +1,5 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -769,6 +771,7 @@ fn pack_info(pack_path: &Path, mods: &[PathBuf]) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    arklay::logging::init();
     let cli = Cli::parse();
 
     match cli.command {
@@ -799,7 +802,7 @@ fn main() -> Result<()> {
         },
         None => {
             let Some(pack) = cli.pack else {
-                bail!("a game pack is required (or use `arklay convert-game`)");
+                return arklay::launcher::run();
             };
             let tracing = cli.trace.is_some();
             let (config, warnings) = arklay::config::Config::load_default();

@@ -26,6 +26,7 @@ hd = [
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+fontdue = "0.9"
 image-webp = { version = "0.2", optional = true }
 lewton = { version = "0.10", optional = true }
 mlua = { version = "0.10", default-features = false, features = [
@@ -43,6 +44,12 @@ zstd = "0.13"
 
 [target.'cfg(windows)'.dependencies]
 sdl3-sys = { version = "0.7", default-features = false, features = ["build-from-source-static"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+] }
 
 [lints.rust]
 warnings = "deny"

@@ -1,9 +1,11 @@
 //! The user configuration file and the default save location.
 //!
-//! `arklay.toml` lives in the per-user configuration directory
-//! (`$XDG_CONFIG_HOME/arklay`, else `~/.config/arklay`, else
-//! `%APPDATA%\arklay`) and is optional: a missing file is the default
-//! configuration. The grammar is the same small TOML subset the pack manifest
+//! `arklay.toml` lives in the per-user configuration directory: an existing
+//! local `arklay.toml` (`%LOCALAPPDATA%\arklay` on Windows,
+//! `$XDG_DATA_HOME/arklay` on Linux) takes over, otherwise the roaming
+//! directory is used (`%APPDATA%\arklay` / `$XDG_CONFIG_HOME/arklay`), and
+//! `$ARKLAY_CONFIG_DIR` overrides both. The file is optional: a missing file
+//! is the default configuration. The grammar is the same small TOML subset the pack manifest
 //! uses — comments, blank lines and `key = "value"`, plus TOML's literal
 //! `key = 'value'` strings so a Windows path needs no escaping — with two
 //! root keys and four tables (the `[graphics]` table also takes bare integers
@@ -64,12 +66,12 @@ use crate::controls::{ACTIONS, Action, Bindings, Source};
 use crate::video::{self, Graphics, RendererKind};
 
 /// The configuration file's name inside the configuration directory.
-pub const FILE_NAME: &str = "arklay.toml";
+pub const FILE_NAME: &str = crate::paths::CONFIG_FILE;
 /// The per-user directory name under the platform's configuration root.
-pub const DIR_NAME: &str = "arklay";
+pub const DIR_NAME: &str = crate::paths::APP_DIR;
 /// The environment variable that relocates the configuration directory (and
 /// with it the default save directory).
-pub const DIR_ENV: &str = "ARKLAY_CONFIG_DIR";
+pub const DIR_ENV: &str = crate::paths::CONFIG_ENV;
 /// The default save directory's name inside the configuration directory.
 pub const SAVE_DIR_NAME: &str = "save";
 /// The per-user mods directory's name inside the configuration directory.
@@ -133,23 +135,11 @@ enum Table {
 }
 
 impl Config {
-    /// The per-user configuration directory: `$ARKLAY_CONFIG_DIR` when set,
-    /// else `$XDG_CONFIG_HOME/arklay` on Unix (else `~/.config/arklay`) and
-    /// `%APPDATA%\arklay` on Windows (else `~/.config/arklay`).
+    /// The configuration directory: [`crate::paths::config_dir`], which is
+    /// `$ARKLAY_CONFIG_DIR` when set, else an existing local `arklay.toml`,
+    /// else the platform's roaming configuration directory.
     pub fn dir() -> PathBuf {
-        if let Some(dir) = env_path(DIR_ENV) {
-            return dir;
-        }
-        if let Some(root) = env_path("XDG_CONFIG_HOME").filter(|_| !cfg!(windows)) {
-            return root.join(DIR_NAME);
-        }
-        if let Some(appdata) = env_path("APPDATA").filter(|_| cfg!(windows)) {
-            return appdata.join(DIR_NAME);
-        }
-        match home_dir() {
-            Some(home) => home.join(".config").join(DIR_NAME),
-            None => PathBuf::from(DIR_NAME),
-        }
+        crate::paths::config_dir()
     }
 
     /// The configuration file's path inside [`Config::dir`].

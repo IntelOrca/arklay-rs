@@ -84,9 +84,11 @@ use sdl3_sys::timer::{SDL_DelayNS, SDL_GetTicksNS};
 use sdl3_sys::video::{
     SDL_CreateWindow, SDL_DestroyWindow, SDL_DisplayID, SDL_GetDisplayForWindow,
     SDL_GetDisplayUsableBounds, SDL_GetDisplays, SDL_GetPrimaryDisplay, SDL_GetWindowBordersSize,
-    SDL_GetWindowPixelDensity, SDL_SetWindowFullscreen, SDL_SetWindowFullscreenMode,
-    SDL_SetWindowPosition, SDL_SetWindowSize, SDL_SetWindowTitle, SDL_ShowWindow, SDL_SyncWindow,
-    SDL_WINDOW_HIDDEN, SDL_WINDOWPOS_CENTERED_DISPLAY, SDL_Window, SDL_WindowFlags,
+    SDL_GetWindowPixelDensity, SDL_GetWindowSize, SDL_GetWindowSizeInPixels,
+    SDL_SetWindowFullscreen, SDL_SetWindowFullscreenMode, SDL_SetWindowMinimumSize,
+    SDL_SetWindowPosition, SDL_SetWindowResizable, SDL_SetWindowSize, SDL_SetWindowTitle,
+    SDL_ShowWindow, SDL_SyncWindow, SDL_WINDOW_HIDDEN, SDL_WINDOWPOS_CENTERED_DISPLAY, SDL_Window,
+    SDL_WindowFlags,
 };
 
 use crate::anim;
@@ -1059,7 +1061,7 @@ enum Backend {
 ///
 /// The guards are declared before the raw window pointer so the backend,
 /// window and SDL tear down in that order.
-struct Display {
+pub(crate) struct Display {
     backend: Backend,
     _window: WindowHandle,
     _sdl: SdlHandle,
@@ -1073,7 +1075,7 @@ impl Display {
     /// Open the window `graphics` describes (see [`crate::video`]); `capture`
     /// instead opens a fixed 960x720 window on SDL's offscreen software
     /// driver for headless captures, which ignore `graphics`.
-    fn new(title: &str, capture: bool, graphics: Graphics) -> Result<Self> {
+    pub(crate) fn new(title: &str, capture: bool, graphics: Graphics) -> Result<Self> {
         if capture {
             unsafe {
                 SDL_SetHint(SDL_HINT_VIDEO_DRIVER, c"offscreen".as_ptr());
@@ -1159,7 +1161,7 @@ impl Display {
     }
 
     /// Alt+Enter: toggle borderless fullscreen and the window.
-    fn toggle_fullscreen(&mut self) {
+    pub(crate) fn toggle_fullscreen(&mut self) {
         let window = self.window;
         let Some(graphics) = self.graphics.as_mut() else {
             return;
@@ -1187,7 +1189,7 @@ impl Display {
 
     /// Persist the window options to `arklay.toml`; a failure is reported and
     /// the change still applies for this run.
-    fn save_window(&self) {
+    pub(crate) fn save_window(&self) {
         let Some(graphics) = &self.graphics else {
             return;
         };
@@ -1317,13 +1319,124 @@ impl Display {
 
     /// Flip the drawn backbuffer to the screen. The GPU backend presents in
     /// [`Display::present_layers`].
-    fn show(&self) -> Result<()> {
+    pub(crate) fn show(&self) -> Result<()> {
         if let Backend::Software { renderer, .. } = &self.backend
             && !unsafe { SDL_RenderPresent(renderer.0) }
         {
             bail!("SDL_RenderPresent failed: {}", sdl_error());
         }
         Ok(())
+    }
+
+    /// Upload a native-resolution UI frame and draw it one-to-one over the
+    /// whole window. The launcher draws at the window's pixel size, so this
+    /// needs no viewport math; the software backend is the only one the
+    /// launcher opens.
+    pub(crate) fn present_ui(&mut self, width: u32, height: u32, rgba: &[u8]) -> Result<()> {
+        if width == 0 || height == 0 || rgba.len() != width as usize * height as usize * 4 {
+            bail!(
+                "launcher frame is {} bytes, expected {}x{}x4",
+                rgba.len(),
+                width,
+                height
+            );
+        }
+        let Backend::Software { texture, renderer } = &mut self.backend else {
+            bail!("the launcher needs the software renderer");
+        };
+        let texture = texture.fit(renderer.0, width, height)?;
+        if !unsafe {
+            SDL_UpdateTexture(
+                texture,
+                std::ptr::null(),
+                rgba.as_ptr().cast::<c_void>(),
+                width as i32 * 4,
+            )
+        } {
+            bail!("SDL_UpdateTexture failed: {}", sdl_error());
+        }
+        if !unsafe { SDL_RenderClear(renderer.0) } {
+            bail!("SDL_RenderClear failed: {}", sdl_error());
+        }
+        let (mut out_width, mut out_height) = (0, 0);
+        if !unsafe { SDL_GetCurrentRenderOutputSize(renderer.0, &mut out_width, &mut out_height) } {
+            bail!("SDL_GetCurrentRenderOutputSize failed: {}", sdl_error());
+        }
+        let source = SDL_FRect {
+            x: 0.0,
+            y: 0.0,
+            w: width as f32,
+            h: height as f32,
+        };
+        let destination = SDL_FRect {
+            x: 0.0,
+            y: 0.0,
+            w: out_width.max(1) as f32,
+            h: out_height.max(1) as f32,
+        };
+        if !unsafe { SDL_RenderTexture(renderer.0, texture, &source, &destination) } {
+            bail!("SDL_RenderTexture failed: {}", sdl_error());
+        }
+        Ok(())
+    }
+
+    /// Let the user drag the launcher's window to any size at or above a
+    /// usable minimum; the game windows stay non-resizable.
+    pub(crate) fn set_resizable(&mut self, resizable: bool) {
+        unsafe {
+            SDL_SetWindowResizable(self.window, resizable);
+            if resizable {
+                SDL_SetWindowMinimumSize(self.window, 640, 480);
+            }
+        }
+    }
+
+    /// The window's client size in window coordinates (before the display
+    /// scale), which is what SDL's mouse events use.
+    pub(crate) fn window_size(&self) -> (u32, u32) {
+        let (mut width, mut height) = (0, 0);
+        if unsafe { SDL_GetWindowSize(self.window, &mut width, &mut height) }
+            && width > 0
+            && height > 0
+        {
+            return (width as u32, height as u32);
+        }
+        (0, 0)
+    }
+
+    /// The window's drawable size in pixels.
+    pub(crate) fn drawable_size(&self) -> (u32, u32) {
+        let (mut width, mut height) = (0, 0);
+        if unsafe { SDL_GetWindowSizeInPixels(self.window, &mut width, &mut height) }
+            && width > 0
+            && height > 0
+        {
+            return (width as u32, height as u32);
+        }
+        let (mut width, mut height) = (0, 0);
+        if unsafe { SDL_GetWindowSize(self.window, &mut width, &mut height) }
+            && width > 0
+            && height > 0
+        {
+            return (width as u32, height as u32);
+        }
+        (0, 0)
+    }
+
+    /// Record the windowed size the user dragged the launcher to, so the next
+    /// run opens at it. Fullscreen sizes are owned by the display.
+    pub(crate) fn note_window_size(&mut self) {
+        let (width, height) = self.drawable_size();
+        let Some(graphics) = self.graphics.as_mut() else {
+            return;
+        };
+        if graphics.fullscreen {
+            return;
+        }
+        if width > 0 && height > 0 {
+            graphics.window_width = width;
+            graphics.window_height = height;
+        }
     }
 
     /// Read the drawn frame back and write it as a BMP.

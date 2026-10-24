@@ -27,6 +27,29 @@ The `hd` feature (also default) pulls the pure-Rust `png`, `image-webp` and
 `lewton` crates that decode a mod's replacement art and audio; without it the
 engine still resolves replacements by stem but refuses to decode those formats.
 
+## Launcher
+
+Running `arklay` with no arguments opens the startup launcher. Naming a pack
+on the command line skips it and boots the game directly. The launcher locates
+Steam's RE1 install, creates or refreshes `games/re1.akpak`, lists installed
+packs, toggles and reorders mods, and checks the release and nightly update
+channels. (The current branch is the launcher shell with placeholder data;
+detection and conversion land next.)
+
+Data resolves by precedence:
+
+- configuration and saves: `%APPDATA%\arklay` on Windows,
+  `$XDG_CONFIG_HOME/arklay` on Linux; an existing `arklay.toml` in the local
+  data directory takes over instead
+- games, mods and logs: `%LOCALAPPDATA%\arklay` (`$XDG_DATA_HOME/arklay`)
+- `ARKLAY_DATA=C:\one;C:\two` replaces the data-root list entirely, with the
+  first path chosen for new files; otherwise the order is the local data
+  directory, the roaming directory, then the executable's directory
+- `ARKLAY_CONFIG_DIR` relocates configuration and saves
+
+The launcher's text face is [Departure Mono](https://github.com/rektdeckard/departure-mono),
+MIT licensed; the notice is in `assets/DepartureMono-LICENSE`.
+
 ## Usage
 
 ```sh
