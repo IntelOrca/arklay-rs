@@ -2127,10 +2127,10 @@ STATES = {
 -- damage latch, run the state table under the message gate and close with the
 -- shared collision pass and the switch-zone shadow bit.
 -- The Hunter's sounds (`enemy/em06_*`). The four stage-3 rooms 0x308-0x30B load
--- the `He_*` takes instead (`enemy/em06_he_*`).
+-- style 0x01, the `He_*` takes (`enemy/em06_01_*`).
 -- TODO: a per-room hack until room scripts can pick a spawn's sound style.
 sounds = {
-    styles = { [0x308] = "he", [0x309] = "he", [0x30A] = "he", [0x30B] = "he" },
+    styles = { [0x308] = 0x01, [0x309] = 0x01, [0x30A] = 0x01, [0x30B] = 0x01 },
 }
 
 function update(e)

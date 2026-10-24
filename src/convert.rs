@@ -824,7 +824,7 @@ fn copy_se(
             let file = format!("{}.wav", name.to_ascii_lowercase());
             if let Some(path) = index.get(&file) {
                 files.push((
-                    format!("{}/{set}_{slot:02}.wav", sfx::ENEMY_DIR),
+                    format!("{}/{set}_{slot:02x}.wav", sfx::ENEMY_DIR),
                     path.clone(),
                 ));
             }
@@ -3882,7 +3882,7 @@ mod tests {
         // Each enemy's own sounds sit next to its script, by slot.
         assert_eq!(pack.read("enemy/em00_04.wav").unwrap().as_ref(), b"z_osou");
         assert_eq!(
-            pack.read("enemy/em00_isi_04.wav").unwrap().as_ref(),
+            pack.read("enemy/em00_02_04.wav").unwrap().as_ref(),
             b"z_isi02"
         );
         assert_eq!(pack.read("enemy/em04_08.wav").unwrap().as_ref(), b"poison");

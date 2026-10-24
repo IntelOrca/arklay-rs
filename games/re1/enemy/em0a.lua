@@ -663,10 +663,10 @@ end
 
 local STATES = { init, run, damaged, death }
 
--- The Adder's sounds (`enemy/em0a_*`); the second Adder room loads the
--- `PYe_*` takes (`enemy/em0a_e_*`).
+-- The Adder's sounds (`enemy/em0a_*`); the second Adder room loads style
+-- 0x01, the `PYe_*` takes (`enemy/em0a_01_*`).
 -- TODO: a per-room hack until room scripts can pick a spawn's sound style.
-sounds = { styles = { [0x30D] = "e" } }
+sounds = { styles = { [0x30D] = 0x01 } }
 
 function update(e)
     -- Monsters freeze behind a message: the state machine and the whole

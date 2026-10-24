@@ -274,7 +274,7 @@ mod imp {
         ) -> Vec<String> {
             self.pack.set(pack as *const Pack);
             let mut sets = vec![format!("em{id:02x}")];
-            let mut style: Option<Option<String>> = None;
+            let mut style: Option<Option<u8>> = None;
             let mut next = Some(id);
             while let Some(id) = next.take() {
                 let _ = self.function(pack, id);
@@ -285,7 +285,7 @@ mod imp {
                     style = sounds
                         .styles
                         .as_ref()
-                        .map(|styles| styles.get(&room).cloned());
+                        .map(|styles| styles.get(&room).copied());
                 }
                 let Some(base) = &sounds.base else {
                     break;
@@ -296,7 +296,7 @@ mod imp {
                 sets.push(base.clone());
                 next = enemy_set_id(base);
             }
-            crate::sfx::enemy_sound_stems(&sets, style.flatten().as_deref(), slot)
+            crate::sfx::enemy_sound_stems(&sets, style.flatten(), slot)
         }
 
         /// Create the VM when the first script loads.
@@ -324,12 +324,12 @@ mod imp {
     /// per-room styles it selects.
     ///
     /// `sounds = "em00"` inherits `em00`'s sounds; the table form
-    /// `sounds = { base = "em00", styles = { [0x103] = "isi" } }` also picks
-    /// the style each room (`stage << 8 | room`) plays.
+    /// `sounds = { base = "em00", styles = { [0x103] = 0x02 } }` also picks
+    /// the style id each room (`stage << 8 | room`) plays.
     #[derive(Debug, Clone, Default, PartialEq)]
     struct EnemySounds {
         base: Option<String>,
-        styles: Option<HashMap<u16, String>>,
+        styles: Option<HashMap<u16, u8>>,
     }
 
     impl EnemySounds {
@@ -346,7 +346,7 @@ mod imp {
                         .get::<Option<Table>>("styles")?
                         .map(|styles| {
                             styles
-                                .pairs::<u16, String>()
+                                .pairs::<u16, u8>()
                                 .collect::<mlua::Result<HashMap<_, _>>>()
                         })
                         .transpose()?;
@@ -5085,7 +5085,7 @@ mod tests {
             .flat_map(|(set, slots)| {
                 slots
                     .iter()
-                    .map(move |(slot, name)| (format!("{ENEMY_DIR}/{set}_{slot:02}"), *name))
+                    .map(move |(slot, name)| (format!("{ENEMY_DIR}/{set}_{slot:02x}"), *name))
             })
             .collect();
         let pack = pack(crate::enemy::ENEMY_SCRIPTS);
@@ -5112,7 +5112,7 @@ mod tests {
         let pack = pack(&[
             (
                 "enemy/em40.lua",
-                "sounds = { base = 'em41', styles = { [0x105] = 'wet' } }\nfunction update(e) end",
+                "sounds = { base = 'em41', styles = { [0x105] = 0x2b } }\nfunction update(e) end",
             ),
             (
                 "enemy/em41.lua",
@@ -5124,11 +5124,11 @@ mod tests {
         assert_eq!(
             host.enemy_sound_stems(&pack, 0x40, 0x105, 3),
             [
-                "enemy/em40_wet_03",
+                "enemy/em40_2b_03",
                 "enemy/em40_03",
-                "enemy/em41_wet_03",
+                "enemy/em41_2b_03",
                 "enemy/em41_03",
-                "shared/beast_wet_03",
+                "shared/beast_2b_03",
                 "shared/beast_03"
             ]
         );

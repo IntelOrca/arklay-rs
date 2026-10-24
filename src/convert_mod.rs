@@ -907,7 +907,7 @@ fn classify_sound(file: &str) -> Class {
         slots
             .iter()
             .filter(|(_, name)| name.eq_ignore_ascii_case(stem))
-            .map(move |(slot, _)| format!("{}/{set}_{slot:02}.wav", crate::sfx::ENEMY_DIR))
+            .map(move |(slot, _)| format!("{}/{set}_{slot:02x}.wav", crate::sfx::ENEMY_DIR))
     });
     Class::Map(
         std::iter::once(format!("se/{stem}.wav"))
@@ -1598,7 +1598,7 @@ mod tests {
         let map = mapped_entries(&paths, &[]);
         assert_eq!(
             map["sound/Z_ISI02.WAV"],
-            ["se/z_isi02.wav", "enemy/em00_isi_04.wav"]
+            ["se/z_isi02.wav", "enemy/em00_02_04.wav"]
         );
         assert_eq!(map["sound/ft_wdA.wav"], ["se/ft_wda.wav"]);
     }

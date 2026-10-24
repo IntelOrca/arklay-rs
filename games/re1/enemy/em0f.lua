@@ -887,10 +887,10 @@ local STATES = { init, state_check, damaged, die }
 -- The per-frame entry.
 -- ---------------------------------------------------------------------------
 
--- The monster plant's sounds (`enemy/em0f_*`); room 0x400 swaps the whip
--- for `VN_kazea` (`enemy/em0f_kaze_*`).
+-- The monster plant's sounds (`enemy/em0f_*`); room 0x400 loads style 0x01,
+-- which swaps the whip for `VN_kazea` (`enemy/em0f_01_*`).
 -- TODO: a per-room hack until room scripts can pick a spawn's sound style.
-sounds = { styles = { [0x400] = "kaze" } }
+sounds = { styles = { [0x400] = 0x01 } }
 
 function update(e)
     -- The state dispatch and the head hit retarget are inside the monster

@@ -2702,27 +2702,28 @@ pub fn enemy_sound_set_stem(set: &str) -> String {
 /// `sets` (the enemy's own set first, then each `sounds` base it inherits)
 /// under the optional sound `style`.
 ///
-/// Each set contributes `{set}_{style}_{slot:02}` (when a style is active)
-/// and then `{set}_{slot:02}`, so a style only needs to ship the slots it
-/// changes. The first stem the pack carries plays; none means silence.
-pub fn enemy_sound_stems(sets: &[String], style: Option<&str>, slot: u8) -> Vec<String> {
+/// Each set contributes `{set}_{style:02x}_{slot:02x}` (when a style is
+/// active) and then `{set}_{slot:02x}`, so a style only needs to ship the
+/// slots it changes. The first stem the pack carries plays; none means
+/// silence.
+pub fn enemy_sound_stems(sets: &[String], style: Option<u8>, slot: u8) -> Vec<String> {
     let mut stems = Vec::with_capacity(sets.len() * 2);
     for set in sets {
         let stem = enemy_sound_set_stem(set);
         if let Some(style) = style {
-            stems.push(format!("{stem}_{style}_{slot:02}"));
+            stems.push(format!("{stem}_{style:02x}_{slot:02x}"));
         }
-        stems.push(format!("{stem}_{slot:02}"));
+        stems.push(format!("{stem}_{slot:02x}"));
     }
     stems
 }
 
 /// The enemy sound files the converter extracts from the original install:
-/// `(set, [(slot, wav name)])`, packed as `enemy/{set}_{slot:02}.wav`.
+/// `(set, [(slot, wav name)])`, packed as `enemy/{set}_{slot:02x}.wav`.
 ///
 /// Each enemy's default set is the one most of its rooms load in the shipped
-/// per-room table. A `{id}_{style}` set carries only the slots a style
-/// changes; the enemy scripts pick the style (the zombies key it by room, as
+/// per-room table. A `{id}_{style:02x}` set carries only the slots a style
+/// changes (the comment names the original takes it holds); the enemy scripts pick the style (the zombies key it by room, as
 /// the original's tables did). Enemies that share a set reference it from
 /// their script's `sounds` declaration instead of repeating it here.
 #[rustfmt::skip]
@@ -2730,20 +2731,24 @@ pub static ENEMY_SOUNDS: &[(&str, &[(u8, &str)])] = &[
     // Standard zombie; the green zombie (em11) inherits it.
     ("em00", &[(0, "z_taore"), (1, "z_ftL"), (2, "z_ftR"), (3, "z_kamu"), (4, "z_osou"),
                (5, "z_unaruA"), (6, "z_head"), (7, "z_Hkick"), (8, "z_Ugoron"), (9, "z_unaruB")]),
-    ("em00_aoya", &[(4, "z_aoya02"), (5, "z_aoya01"), (9, "z_aoya03")]),
-    ("em00_isi", &[(4, "z_isi02"), (5, "z_isi01"), (9, "z_isi03")]),
-    ("em00_isi2", &[(4, "z_isi202"), (5, "z_isi201"), (9, "z_isi203")]),
-    ("em00_isi3", &[(4, "z_isi302"), (5, "z_isi301"), (9, "z_isi303")]),
-    ("em00_isi3b", &[(4, "z_isi301"), (5, "z_isi302"), (9, "z_isi303")]),
-    ("em00_k", &[(4, "z_k02"), (5, "z_k01"), (7, "z_haki"), (8, "z_sanj"), (9, "z_k03")]),
-    ("em00_k2", &[(4, "z_k02"), (5, "z_k01"), (9, "z_k03")]),
-    ("em00_mika", &[(4, "z_mika02"), (5, "z_mika01"), (9, "z_mika03")]),
-    ("em00_simo", &[(4, "z_simo02"), (5, "z_simo01"), (9, "z_simo03")]),
-    ("em00_suzu", &[(4, "z_suzu02"), (5, "z_suzu01"), (7, "z_haki"), (8, "z_sanj"),
-                    (9, "z_suzu03")]),
-    ("em00_suzu2", &[(4, "z_suzu02"), (5, "z_suzu01"), (9, "z_suzu03")]),
-    ("em00_tomo", &[(1, "ze_ftL"), (3, "ze_kamu"), (4, "ze_tomo2"), (5, "ze_tomo1"),
-                    (6, "ze_head"), (7, "ze_haki"), (8, "ze_sanj"), (9, "ze_tomo3")]),
+    // Its groan styles (`lib/zombie.lua` picks them per room), named after
+    // the original takes: 01 aoya, 02 isi, 03 isi2, 04 isi3, 05 isi3 with 01
+    // and 02 swapped, 06 k (with haki/sanj), 07 k, 08 mika, 09 simo, 0a suzu
+    // (with haki/sanj), 0b suzu, 0c tomo.
+    ("em00_01", &[(4, "z_aoya02"), (5, "z_aoya01"), (9, "z_aoya03")]),
+    ("em00_02", &[(4, "z_isi02"), (5, "z_isi01"), (9, "z_isi03")]),
+    ("em00_03", &[(4, "z_isi202"), (5, "z_isi201"), (9, "z_isi203")]),
+    ("em00_04", &[(4, "z_isi302"), (5, "z_isi301"), (9, "z_isi303")]),
+    ("em00_05", &[(4, "z_isi301"), (5, "z_isi302"), (9, "z_isi303")]),
+    ("em00_06", &[(4, "z_k02"), (5, "z_k01"), (7, "z_haki"), (8, "z_sanj"), (9, "z_k03")]),
+    ("em00_07", &[(4, "z_k02"), (5, "z_k01"), (9, "z_k03")]),
+    ("em00_08", &[(4, "z_mika02"), (5, "z_mika01"), (9, "z_mika03")]),
+    ("em00_09", &[(4, "z_simo02"), (5, "z_simo01"), (9, "z_simo03")]),
+    ("em00_0a", &[(4, "z_suzu02"), (5, "z_suzu01"), (7, "z_haki"), (8, "z_sanj"),
+                  (9, "z_suzu03")]),
+    ("em00_0b", &[(4, "z_suzu02"), (5, "z_suzu01"), (9, "z_suzu03")]),
+    ("em00_0c", &[(1, "ze_ftL"), (3, "ze_kamu"), (4, "ze_tomo2"), (5, "ze_tomo1"),
+                  (6, "ze_head"), (7, "ze_haki"), (8, "ze_sanj"), (9, "ze_tomo3")]),
     // Naked zombie.
     ("em01", &[(0, "z_taore"), (1, "zep_ftL"), (2, "z_ftR"), (3, "ze_kamu"), (4, "z_nisi2"),
                (5, "z_nisi1"), (6, "ze_head"), (7, "ze_haki"), (8, "ze_sanj"), (9, "z_nisi3")]),
@@ -2761,7 +2766,8 @@ pub static ENEMY_SOUNDS: &[(&str, &[(u8, &str)])] = &[
     // Hunter.
     ("em06", &[(0, "HU_walkA"), (1, "HU_walkB"), (2, "HU_jump"), (3, "HU_att"), (4, "HU_land"),
                (5, "HU_smash"), (6, "HU_dam"), (7, "HU_Nout")]),
-    ("em06_he", &[(0, "He_walkA"), (1, "He_walkB"), (2, "He_jump"), (3, "He_att"),
+    // Style 01: the `He_*` takes.
+    ("em06_01", &[(0, "He_walkA"), (1, "He_walkB"), (2, "He_jump"), (3, "He_att"),
                   (4, "He_land"), (5, "He_smash"), (6, "He_dam"), (7, "He_Nout")]),
     // Wasp.
     ("em07", &[(0, "bee4_ed"), (1, "hatinage"), (2, "bee_fumu")]),
@@ -2773,7 +2779,8 @@ pub static ENEMY_SOUNDS: &[(&str, &[(u8, &str)])] = &[
                (5, "FL_slash"), (6, "FL_att"), (7, "FL_dam"), (8, "FL_out")]),
     // Adder.
     ("em0a", &[(0, "PY_mena"), (1, "PY_hit2"), (2, "PY_fall")]),
-    ("em0a_e", &[(0, "PYe_mena"), (1, "PYe_hit"), (2, "PYe_fall")]),
+    // Style 01: the `PYe_*` takes.
+    ("em0a_01", &[(0, "PYe_mena"), (1, "PYe_hit"), (2, "PYe_fall")]),
     // Neptune.
     ("em0b", &[(0, "nep_attB"), (1, "nep_attA"), (2, "nep_nomu"), (3, "nep_tura"),
                (4, "nep_twis"), (5, "nep_jump")]),
@@ -2785,7 +2792,8 @@ pub static ENEMY_SOUNDS: &[(&str, &[(u8, &str)])] = &[
                (5, "GV_blood"), (6, "GV_gulpA"), (7, "GV_gulpB")]),
     // Monster plant.
     ("em0f", &[(0, "VN_whip"), (1, "VN_hitA"), (2, "VN_hitB"), (3, "VN_sime"), (4, "VN_OUT")]),
-    ("em0f_kaze", &[(0, "VN_kazea")]),
+    // Style 01: the `VN_kazea` whip.
+    ("em0f_01", &[(0, "VN_kazea")]),
     // Tyrant (the heliport encounter): its own full set, since its slots 5
     // and 6 differ from the lab Tyrant's in which one is empty.
     ("em10", &[(0, "TY_foot"), (1, "TY_kaze"), (2, "TY_slice"), (3, "TY_HIT"), (4, "TY_trust"),
@@ -3340,17 +3348,17 @@ mod tests {
     fn enemy_sound_stems_try_the_style_then_each_inherited_set() {
         let sets = ["em11".to_string(), "em00".to_string()];
         assert_eq!(
-            enemy_sound_stems(&sets, Some("isi"), 4),
+            enemy_sound_stems(&sets, Some(0x0a), 4),
             [
-                "enemy/em11_isi_04",
+                "enemy/em11_0a_04",
                 "enemy/em11_04",
-                "enemy/em00_isi_04",
+                "enemy/em00_0a_04",
                 "enemy/em00_04"
             ]
         );
         assert_eq!(
             enemy_sound_stems(&["lib/zombie".to_string(), "/x/y".to_string()], None, 12),
-            ["enemy/lib/zombie_12", "x/y_12"]
+            ["enemy/lib/zombie_0c", "x/y_0c"]
         );
     }
 
