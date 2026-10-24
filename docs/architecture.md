@@ -30,6 +30,8 @@ responsibility.
 | `atomic` | Tooling | Sibling-temp-then-rename single-file output used by every artifact writer |
 | `verify` | Tooling | `arklay verify`: path-classified parse of every pack entry with a per-format report |
 | `stats` | Tooling | Fixed-bucket frame-time histogram and the `--stats` report |
+| `hash` | Tooling | `arklay hash`: the HD texture-pack filename hash and its per-class texture conversion |
+| `trace` | Tooling | Oracle trace v1 emission (`oracle/trace-v1.md`) shared by the C++ reference and arklay |
 
 ### Runtime
 
@@ -38,7 +40,12 @@ responsibility.
 | `engine` | Runtime | Entry points, room loading, the fixed 30 Hz game loop, transitions, headless simulate/capture seams, SDL window/renderer |
 | `game` | Runtime | `GameState`, script hosts, entities, items, flags, room actions, effects tick, save integration |
 | `state` | Runtime | `RoomId`, `RoomState` (cuts, zones, collisions, lights), `Image` |
+| `controls` | Runtime | The logical action map: every action the game reads and the physical keyboard, mouse and gamepad bindings to it |
+| `speed` | Runtime | The F2/F3 gameplay speed multiplier on the fixed-tick interval (1x..3x) |
+| `combat` | Runtime | Shared combat tables (weapon hit ranges and damage) and the weapon-damage pipeline |
+| `weapons` | Runtime | The player weapon runtime: aim, fire, reload and the held-weapon FX |
 | `player` | Runtime | Player locomotion, input mapping, collision, reach probes, camera cuts |
+| `player_script` | Runtime | The player's scripted-animation states |
 | `rdt` | Format | RDT room parser (header pointers, cameras, zones, collisions, embedded model/TIM pairs) |
 | `scd` | Runtime/Format | SCD opcode tables, reader, IR, disassembler/decompiler, assembler, command and event VMs |
 | `door` | Format/Runtime | `.dor` container parser and the door-animation VM |
@@ -48,6 +55,8 @@ responsibility.
 | `enemy` | Runtime | Entities: the shared character/monster runtime, the pack-script host, movement/pathfinding/SCA helpers, the scripted-character and monster machines |
 | `effects` | Runtime | The 64-slot billboard effect pool, per-room sprite tables, packed texture pages, behaviours |
 | `items` | Runtime | Item tables: names, classes, pickup rules, stacking |
+| `examine` | Runtime | The item viewer's game rules: the examine check, turntable spin and viewer camera |
+| `demo` | Runtime | The attract-demo reels (`demo/<hex>.dat`) and their recorded pad words |
 | `message` | Runtime | The seven-state message window and its byte grammar |
 | `save` | Runtime | The 0x800-byte BioCard block, slot I/O, the folder scan and explicit-path actions the screen API uses, `Apply_to`/`from_state` round-trip |
 | `config` | Runtime | The user configuration file (`arklay.toml`): `save_dir`, `language`, `[bindings]`, `[game]`, `[graphics]` and `[mods]`; the default `<config dir>/save` and `<config dir>/mods` locations |
@@ -66,8 +75,12 @@ responsibility.
 | Module | Owner | Responsibility |
 |---|---|---|
 | `render` | Presentation | Deterministic software rasterizer: framebuffer, models, masks, shadows, effect billboards, lighting |
+| `raster` | Presentation | The reference's 3D triangle pipeline reproduced step for step, for llvmpipe-exact pixels |
 | `gpu` | Presentation | Optional interactive SDL_GPU renderer for the gameplay scene (`--renderer gpu`); never used by captures, traces or tests of record |
+| `htexture` | Presentation | HD texture replacement by content hash (`htexture/`), including the loader cache-list mask pairing |
 | `video` | Presentation | The `[graphics]` options, the 4:3 viewport fit and the F8 window steps |
+| `tween` | Presentation | Presentation tweening for render rates above the 30 Hz simulation |
+| `pacer` | Presentation | When the interactive loop presents a frame |
 | `model` | Presentation | Shared decoded model types (`Texture8`, mesh/skeleton vocabulary) |
 | `anim` | Presentation | Fixed-point skeletal animation and clip playback |
 | `tmd` | Format | PSX TMD mesh parser |
@@ -75,9 +88,12 @@ responsibility.
 | `emd` | Format | EMD character/room model containers and EMW weapon animations |
 | `ivm` | Format | Item-view model (texture page + TMD) parser |
 | `avi` | Format | RIFF/AVI demuxer for the shipped Cinepak films |
+| `mp4` | Format | Minimal ISO-BMFF demuxer for HD (H.264/AAC) film replacements |
+| `media` | Format | Container-independent H.264/AAC film description shared by MP4 and AVI |
 | `cinepak` | Format | Cinepak (`cvid`) frame decoder |
 | `bmp` | Format | BMP encode/decode, including the black-key room-mask decode |
 | `assets` | Format | Replacement-format resolution (`webp > png > bmp > tim > pix`, `ogg > wav`) and the PNG/WebP/OGG decoders behind the default-on `hd` feature; an image page is an indexed `Texture8` or an RGBA `Image` |
+| `hdfilm` | Presentation | HD film decoding: H.264 through OpenH264 on a worker thread, AAC through Symphonia |
 | `lzw` | Format | RE1 `.pak` LZW decoder |
 | `shadow` | Presentation | The player's baked ground shadow: decode and placement |
 | `font` | Presentation | Glyph decoding, per-glyph metrics measured from the sheet's ink, and tinted drawing; draws the synthetic missing-glyph box |

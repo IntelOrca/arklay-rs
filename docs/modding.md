@@ -289,6 +289,9 @@ resolution. The software renderer is 320x240 and keeps the originals.
 - A background or mask image is sampled from the replacement in place of the
   original. The replacement covers the texels its hash window covers: the whole
   background, or 256 x 256 mask texels.
+- A door transition's page is drawn by the GPU renderer as a scene, so the DOR
+  texture takes its page replacement (its single CLUT row) like a model page.
+  The frame's fade stays on the overlay.
 - A model page keeps its original indices, which decide transparency and the STP
   blend. Each CLUT row's colours come from that row's replacement. A 128-texel-wide
   page is stretched to 256 before hashing, as the game uploads it, so its
@@ -301,9 +304,18 @@ resolution. The software renderer is 320x240 and keeps the originals.
   window, or at its own size when smaller. A `.PIX` screen is hashed like a `bgd`
   but with shift widening.
 
+Some masks cannot be named from their own texels: their hash depends on what the
+loader's surface held before the upload. An RE-ENHANCE pack ships the loader's
+`cache/ROOM*.dat` lists, little-endian words of each room's hashes in load order,
+and each camera's mask sits immediately before its background. `htexture` reads
+those lists and pairs a mask with the background hash that follows it. Together
+with the 131 that name themselves, this resolves 407 of the pack's 436 masks from
+an unmodified `hires/` tree. The other 29 are rooms or cameras the lists do not
+cover (#157).
+
 Some 2D art stays software: map room highlighting (drawn through a palette lookup),
-the fonts, the title screen and the raw save screen (`TYPE00.TIM`), whose hashes
-match no file in the RE1 HD pack.
+the fonts, and the raw save screen (`TYPE00.TIM`), whose hash matches no file in
+the RE1 HD pack. The title screen finds a match (#132).
 
 A texture with no replacement is reported once on stderr, with every hash that was
 tried:
