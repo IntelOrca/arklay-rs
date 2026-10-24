@@ -300,6 +300,26 @@ mod imp {
         }
     }
 
+    /// Run a one-shot chunk in a fresh sandbox, called as `(api, arg)`.
+    ///
+    /// The new-game seed uses it: the chunk sees the same authoring API as a
+    /// hook, but no pack hooks are loaded and its globals are dropped after.
+    pub(crate) fn run_chunk(game: &mut GameState, bytes: &[u8], name: &str, arg: u8) -> Result<()> {
+        budget::check_len(bytes.len(), budget::MAX_LUA_CHUNK, &format!("{name} size"))?;
+        let (lua, budget) = new_sandboxed_state()?;
+        let function = lua
+            .load(bytes)
+            .set_name(name.to_string())
+            .into_function()
+            .map_err(|err| anyhow::anyhow!("{name}: {err}"))?;
+        budget.begin();
+        lua.scope(|scope| {
+            let api = scope.create_userdata_ref_mut(game)?;
+            function.call::<()>((api, arg))
+        })
+        .map_err(|err| anyhow::anyhow!("{name}: {err}"))
+    }
+
     /// The hook paths to load: the manifest's ordered list, or every
     /// `lua/**.lua` entry in lowercased-path order.
     fn hook_paths(pack: &Pack) -> Vec<String> {
@@ -401,6 +421,25 @@ mod imp {
                         game.inventory.push(stack);
                     }
                     game.rebuild_slots();
+                    Ok(())
+                },
+            );
+
+            // `set_partner_slot(slot, id[, quantity])`: replace one of
+            // Rebecca's six slots (id 0 empties it).
+            methods.add_method_mut(
+                "set_partner_slot",
+                |_lua, game, (slot, id, quantity): (usize, u8, Option<u8>)| {
+                    let Some(stack) = game.rebecca_inventory.get_mut(slot) else {
+                        return Err(mlua::Error::RuntimeError(format!(
+                            "partner slot {slot} is out of range (0..{})",
+                            crate::game::INVENTORY_SLOTS_CHRIS
+                        )));
+                    };
+                    *stack = crate::game::InventoryItem {
+                        id,
+                        quantity: if id == 0 { 0 } else { quantity.unwrap_or(1) },
+                    };
                     Ok(())
                 },
             );
@@ -614,6 +653,52 @@ mod imp {
 pub use imp::LuaVm;
 
 pub(crate) use imp::{Budget, new_sandboxed_state};
+
+mod scripts {
+    include!(concat!(env!("OUT_DIR"), "/game_scripts.rs"));
+}
+/// The checked-in game scripts (`games/re1/game/**.lua`) as `(entry, source)`
+/// pairs. `convert-game` packs them; a pack that predates them falls back to
+/// these copies.
+pub use scripts::GAME_SCRIPTS;
+
+/// The pack entry that seeds a new game's start inventory.
+pub const NEW_GAME_ENTRY: &str = "game/new_game.lua";
+
+/// Seed a new game's start inventory from the pack's [`NEW_GAME_ENTRY`].
+///
+/// The chunk is called as `(api, character)` over the live new-game state. A
+/// pack without the entry (one converted before it existed) runs the
+/// checked-in copy; a mod's script that fails is logged and the checked-in
+/// copy runs instead, over a re-cleared inventory, so a new game always
+/// starts with items.
+pub fn seed_new_game_inventory(
+    pack: &crate::pack::Pack,
+    game: &mut crate::game::GameState,
+    character: u8,
+) {
+    let builtin = GAME_SCRIPTS
+        .iter()
+        .find(|(entry, _)| *entry == NEW_GAME_ENTRY)
+        .map(|(_, source)| source.as_bytes())
+        .expect("build.rs embeds game/new_game.lua");
+    let partner = game.rebecca_inventory;
+    if pack.contains(NEW_GAME_ENTRY) {
+        match pack.read(NEW_GAME_ENTRY) {
+            Ok(bytes) => match imp::run_chunk(game, &bytes, NEW_GAME_ENTRY, character) {
+                Ok(()) => return,
+                Err(err) => eprintln!("[lua] {err}; using the shipped start items"),
+            },
+            Err(err) => eprintln!("[lua] cannot read {NEW_GAME_ENTRY}: {err:#}"),
+        }
+        game.inventory.clear();
+        game.rebuild_slots();
+        game.rebecca_inventory = partner;
+    }
+    if let Err(err) = imp::run_chunk(game, builtin, NEW_GAME_ENTRY, character) {
+        eprintln!("[lua] built-in {NEW_GAME_ENTRY}: {err}");
+    }
+}
 
 /// Resolve a sandboxed `require(name)` to a lowercased pack entry, or `None`
 /// when no candidate exists (by `contains`) or the path escapes the pack root.

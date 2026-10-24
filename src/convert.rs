@@ -518,6 +518,12 @@ pub fn convert_game_observed(
     )?;
     let (uilua_count, uilua_bytes) =
         copy_scripts("uilua", crate::ui::UI_SCRIPTS, &mut writer, &mut progress)?;
+    let (gamelua_count, gamelua_bytes) = copy_scripts(
+        "gamelua",
+        crate::lua::GAME_SCRIPTS,
+        &mut writer,
+        &mut progress,
+    )?;
     let (effect_count, effect_bytes) =
         copy_effect_sheets(&effects, &mut writer, &mut progress, jobs)?;
     let (font_count, font_bytes) = copy_font(&fonts, &mut writer, &mut progress)?;
@@ -648,6 +654,10 @@ pub fn convert_game_observed(
             "enemylua: {enemylua_count} entries, {enemylua_bytes} bytes"
         )?;
         writeln!(report, "uilua: {uilua_count} entries, {uilua_bytes} bytes")?;
+        writeln!(
+            report,
+            "gamelua: {gamelua_count} entries, {gamelua_bytes} bytes"
+        )?;
         writeln!(
             report,
             "effspr: {effect_count} entries, {effect_bytes} bytes"
@@ -1924,6 +1934,7 @@ pub fn packed_source_hash() -> String {
     for &(name, source) in crate::ui::UI_SCRIPTS
         .iter()
         .chain(crate::enemy::ENEMY_SCRIPTS.iter())
+        .chain(crate::lua::GAME_SCRIPTS.iter())
         .chain(crate::language::LANGUAGE_FILES.iter())
     {
         feed(name.as_bytes());
