@@ -90,10 +90,10 @@ responsibility.
 | `avi` | Format | RIFF/AVI demuxer for the shipped Cinepak films |
 | `mp4` | Format | Minimal ISO-BMFF demuxer for HD (H.264/AAC) film replacements |
 | `media` | Format | Container-independent H.264/AAC film description shared by MP4 and AVI |
+| `hdfilm` | Presentation | HD film decoding: H.264 through OpenH264 on a worker thread, AAC through Symphonia |
 | `cinepak` | Format | Cinepak (`cvid`) frame decoder |
 | `bmp` | Format | BMP encode/decode, including the black-key room-mask decode |
 | `assets` | Format | Replacement-format resolution (`webp > png > bmp > tim > pix`, `ogg > wav`) and the PNG/WebP/OGG decoders behind the default-on `hd` feature; an image page is an indexed `Texture8` or an RGBA `Image` |
-| `hdfilm` | Presentation | HD film decoding: H.264 through OpenH264 on a worker thread, AAC through Symphonia |
 | `lzw` | Format | RE1 `.pak` LZW decoder |
 | `shadow` | Presentation | The player's baked ground shadow: decode and placement |
 | `font` | Presentation | Glyph decoding, per-glyph metrics measured from the sheet's ink, and tinted drawing; draws the synthetic missing-glyph box |
