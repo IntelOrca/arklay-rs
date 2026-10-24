@@ -787,10 +787,12 @@ fn copy_music(
     copy_raw_files(files, "bgm", writer, progress, jobs)
 }
 
-/// Add every sound effect named by the room sound tables.
+/// Add every sound effect named by the room sound tables, and every enemy's
+/// own sound set ([`sfx::ENEMY_SOUNDS`]).
 ///
-/// The pack stores the canonical names lowercased (`se/ft_wda.wav`); the
-/// install's file names are matched case-insensitively and copied raw.
+/// The pack stores the canonical names lowercased (`se/ft_wda.wav`) and the
+/// enemy sets by slot (`enemy/em00_04.wav`); the install's file names are
+/// matched case-insensitively and copied raw.
 fn copy_se(
     sound: &Option<PathBuf>,
     writer: &mut PackWriter,
@@ -812,6 +814,20 @@ fn copy_se(
         match index.get(&file) {
             Some(path) => files.push((format!("se/{file}"), path.clone())),
             None => missing.push(format!("{}.WAV", name.to_ascii_uppercase())),
+        }
+    }
+    // Each enemy's own sounds, packed next to its script and model
+    // (`enemy/em00_04.wav`); the enemy scripts resolve them, not the room
+    // tables.
+    for (set, slots) in sfx::ENEMY_SOUNDS {
+        for (slot, name) in *slots {
+            let file = format!("{}.wav", name.to_ascii_lowercase());
+            if let Some(path) = index.get(&file) {
+                files.push((
+                    format!("{}/{set}_{slot:02x}.wav", sfx::ENEMY_DIR),
+                    path.clone(),
+                ));
+            }
         }
     }
     if !missing.is_empty() {
@@ -3863,6 +3879,26 @@ mod tests {
         assert!(!pack.contains("bgm/000.wav"));
         assert!(pack.contains("se/ft_wda.wav"));
         assert_eq!(pack.read("se/ft_wda.wav").unwrap().as_ref(), b"ft_wdA");
+        // Each enemy's own sounds sit next to its script, by slot.
+        assert_eq!(pack.read("enemy/em00_04.wav").unwrap().as_ref(), b"z_osou");
+        assert_eq!(
+            pack.read("enemy/em00_02_04.wav").unwrap().as_ref(),
+            b"z_isi02"
+        );
+        assert_eq!(pack.read("enemy/em04_08.wav").unwrap().as_ref(), b"poison");
+        assert!(
+            !pack.contains("enemy/em04_00.wav"),
+            "the tiger inherits slot 0"
+        );
+        assert_eq!(
+            pack.paths()
+                .filter(|path| path.starts_with("enemy/") && path.ends_with(".wav"))
+                .count(),
+            sfx::ENEMY_SOUNDS
+                .iter()
+                .map(|(_, slots)| slots.len())
+                .sum::<usize>()
+        );
 
         assert_eq!(
             pack.read("door/door00.dor").unwrap().as_ref(),

@@ -3227,6 +3227,7 @@ impl GameSession {
             &mut self.sfx_cache,
             pack,
             &self.loaded.room,
+            &mut self.enemy_lua,
             &mut self.game.entity_sounds,
         );
         play_player_sounds(
@@ -10377,15 +10378,18 @@ fn play_player_sounds(
     }
 }
 
-/// Consume the tick's NPC sound cues: resolve each queued room sound and play
-/// it as a 3D one-shot through the mixer with the entity's own pan and volume.
-/// The queue is always drained so an absent mixer or camera does not let it
-/// grow without bound.
+/// Consume the tick's NPC sound cues: resolve each queued room or enemy sound
+/// and play it as a 3D one-shot through the mixer with the entity's own pan and
+/// volume. An enemy sound plays the first of the enemy's candidate files the
+/// pack carries ([`enemy::LuaEnemyHost::enemy_sound_stems`]). The queue is
+/// always drained so an absent mixer or camera does not let it grow without
+/// bound.
 fn play_entity_sounds(
     music: &mut Option<Mixer>,
     cache: &mut SfxCache,
     pack: &Pack,
     room: &RoomState,
+    enemy_lua: &mut enemy::LuaEnemyHost,
     sounds: &mut Vec<game::EntitySound>,
 ) {
     if sounds.is_empty() {
@@ -10396,7 +10400,18 @@ fn play_entity_sounds(
         return;
     };
     for sound in sounds.drain(..) {
-        let Some(wav) = cache.load(pack, sound.name) else {
+        let wav = match sound.name {
+            game::SoundName::Room(name) => cache.load(pack, name),
+            game::SoundName::Enemy { id, slot } => {
+                let room_id = u16::from(room.stage) << 8 | u16::from(room.room);
+                enemy_lua
+                    .enemy_sound_stems(pack, id, room_id, slot)
+                    .into_iter()
+                    .find(|stem| pack.has_asset(stem, AssetClass::Audio))
+                    .and_then(|stem| cache.load_stem(pack, stem))
+            }
+        };
+        let Some(wav) = wav else {
             continue;
         };
         let (gain, pan) = sfx::sound_gain_pan(cut.pos, cut.look_at, sound.pos);
@@ -10596,7 +10611,12 @@ impl SfxCache {
     /// Load and parse `se/{name}.wav` (lower-case) from the pack, caching both
     /// hits and misses.
     fn load(&mut self, pack: &Pack, name: &str) -> Option<audio::Wav> {
-        let stem = format!("se/{}", name.to_ascii_lowercase());
+        self.load_stem(pack, format!("se/{}", name.to_ascii_lowercase()))
+    }
+
+    /// Load and parse the audio asset `stem` (any pack path without its
+    /// extension), caching both hits and misses.
+    fn load_stem(&mut self, pack: &Pack, stem: String) -> Option<audio::Wav> {
         if let Some(wav) = self.wavs.get(&stem) {
             return Some(wav.clone());
         }
@@ -17257,7 +17277,7 @@ mod tests {
         let pack = Pack::open(&path).unwrap();
 
         let mut sounds = vec![game::EntitySound {
-            name: "ft_wdA",
+            name: "ft_wdA".into(),
             bank: 2,
             column: 45,
             pos: [0, 0, 0],
@@ -17267,6 +17287,7 @@ mod tests {
             &mut SfxCache::default(),
             &pack,
             &RoomState::default(),
+            &mut enemy::LuaEnemyHost::new(),
             &mut sounds,
         );
         assert!(sounds.is_empty(), "an absent mixer still drains the queue");
@@ -17315,12 +17336,19 @@ mod tests {
             column: u8,
         ) {
             let mut sounds = vec![game::EntitySound {
-                name: "ft_wdA",
+                name: "ft_wdA".into(),
                 bank: 2,
                 column,
                 pos: [1000, 0, 0],
             }];
-            play_entity_sounds(music, cache, pack, room, &mut sounds);
+            play_entity_sounds(
+                music,
+                cache,
+                pack,
+                room,
+                &mut enemy::LuaEnemyHost::new(),
+                &mut sounds,
+            );
         }
 
         cue(&mut music, &mut cache, &pack, &room, 45);

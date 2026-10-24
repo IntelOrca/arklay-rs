@@ -1052,7 +1052,7 @@ pub fn footstep(
     if let Some(name) = sfx::footstep_sound(room, entity.pos, sound_type, slow) {
         let column = sfx::entity_sound_column(room, entity.pos, sound_type, slow).unwrap_or(0);
         sounds.push(EntitySound {
-            name,
+            name: name.into(),
             bank: 2,
             column,
             pos: entity.pos,
@@ -3259,7 +3259,7 @@ pub fn blood_splatter(
         vel_x = vel_x.wrapping_add(0x28);
         vel_y = ((-accel) >> 2) as i16;
         spawn_blood_billboard(game, slot, joint);
-        queue_enemy_cue(game, room, slot, 8);
+        queue_enemy_cue(game, slot, 8);
     }
 
     if vel_x > 0 {
@@ -3297,9 +3297,9 @@ fn spawn_blood_billboard(game: &mut GameState, slot: usize, joint: usize) {
 }
 
 /// Queue one enemy-bank cue at the entity, the shared `Snd_em` tail.
-fn queue_enemy_cue(game: &mut GameState, room: &RoomState, slot: usize, id: u8) {
+fn queue_enemy_cue(game: &mut GameState, slot: usize, id: u8) {
     let group = (game.entities[slot].variant >> 4) & 0x7;
-    if let Some((name, column)) = sfx::enemy_sound(room, id, group) {
+    if let Some((name, column)) = sfx::enemy_sound(game.entities[slot].id, id, group) {
         let pos = game.entities[slot].pos;
         game.entity_sounds.push(EntitySound {
             name,
@@ -3976,7 +3976,7 @@ mod tests {
         footstep(&mut sounds, &room, &e, 0, false);
         assert_eq!(sounds.len(), 1);
         assert_eq!(sounds[0].pos, [100, 0, 100]);
-        assert!(sounds[0].name.starts_with("ft_"));
+        assert!(sounds[0].name.room().unwrap().starts_with("ft_"));
     }
 
     /// One walk zone; `flags` names the adjacent zone indices.
@@ -4733,7 +4733,9 @@ mod tests {
         place(&mut game);
         update(&mut game, 1, &room, &clips);
         assert_eq!(
-            game.entity_sounds.last().map(|sound| sound.name),
+            game.entity_sounds
+                .last()
+                .and_then(|sound| sound.name.room()),
             Some("ft_stwp")
         );
 
@@ -4743,7 +4745,9 @@ mod tests {
         place(&mut game);
         update(&mut game, 1, &room, &clips);
         assert_eq!(
-            game.entity_sounds.last().map(|sound| sound.name),
+            game.entity_sounds
+                .last()
+                .and_then(|sound| sound.name.room()),
             Some("ft_cpA")
         );
     }

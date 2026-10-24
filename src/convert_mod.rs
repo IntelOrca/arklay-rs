@@ -742,9 +742,10 @@ fn classify(relative: &str, mod_roots: &[String]) -> Class {
         Some("effspr") => classify_effect(stem, extension),
         Some("item_m1") => classify_door(stem, extension),
         Some("text") => classify_text(stem, extension),
-        Some("tables") if extension == "xml" => Class::Unsupported(
-            "room sound tables are not converted yet; the rooms keep the base game's effects",
-        ),
+        // Room sound tables only exist to give a room's swapped-in enemies
+        // their sounds (BioRand rewrites one per room); arklay's enemies carry
+        // their own sounds, so the tables are not needed.
+        Some("tables") if extension == "xml" => Class::Skip,
         _ => Class::Unmapped,
     };
     if !matches!(mapped, Class::Unmapped) {
@@ -898,11 +899,25 @@ fn classify_sound(file: &str) -> Class {
         .copied()
         .chain(crate::music::se_track_names())
         .any(|name| name.eq_ignore_ascii_case(stem));
-    if known {
-        raw(format!("se/{stem}.wav"))
-    } else {
-        Class::Unmapped
+    if !known {
+        return Class::Unmapped;
     }
+    // The room tables' copy, plus every enemy sound slot that plays it.
+    let enemy = crate::sfx::ENEMY_SOUNDS.iter().flat_map(|(set, slots)| {
+        slots
+            .iter()
+            .filter(|(_, name)| name.eq_ignore_ascii_case(stem))
+            .map(move |(slot, _)| format!("{}/{set}_{slot:02x}.wav", crate::sfx::ENEMY_DIR))
+    });
+    Class::Map(
+        std::iter::once(format!("se/{stem}.wav"))
+            .chain(enemy)
+            .map(|entry| Target {
+                entry,
+                convert: Convert::Raw,
+            })
+            .collect(),
+    )
 }
 
 /// `voice/`: every table record that plays the file.
@@ -1566,11 +1581,8 @@ mod tests {
             crate::lua::NEW_GAME_ENTRY
         );
         assert_eq!(one(&map, "mod_biorand/bgm_tbl.xml"), "<unsupported>");
-        assert_eq!(
-            one(&map, "mod_biorand/tables/room_106.xml"),
-            "<unsupported>"
-        );
         for skipped in [
+            "mod_biorand/tables/room_106.xml",
             "mod_biorand/biorand.dat",
             "mod_biorand/biorand.dll",
             "mod_biorand/log_pl0.txt",
@@ -1578,6 +1590,17 @@ mod tests {
         ] {
             assert_eq!(one(&map, skipped), "<skip>", "{skipped}");
         }
+    }
+
+    #[test]
+    fn enemy_sound_files_also_replace_every_enemy_slot_that_plays_them() {
+        let paths = ["sound/Z_ISI02.WAV", "sound/ft_wdA.wav"];
+        let map = mapped_entries(&paths, &[]);
+        assert_eq!(
+            map["sound/Z_ISI02.WAV"],
+            ["se/z_isi02.wav", "enemy/em00_02_04.wav"]
+        );
+        assert_eq!(map["sound/ft_wdA.wav"], ["se/ft_wda.wav"]);
     }
 
     #[test]

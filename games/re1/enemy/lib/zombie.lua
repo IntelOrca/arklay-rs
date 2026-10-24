@@ -54,6 +54,38 @@
 
 local M = {}
 
+-- The groan style id each room plays (`enemy/em00_SS_*`), keyed by
+-- `stage << 8 | room`: the shipped per-room tables give the zombies of most
+-- rooms their own groans (slots 4, 5 and 9, some also 7 and 8). A room not
+-- listed plays the default set. Shared by the standard and green zombies.
+-- TODO: a per-room hack until room scripts can pick a spawn's sound style.
+M.SOUND_STYLES = {
+    -- 0x01: z_aoya01-03
+    [0x107] = 0x01, [0x112] = 0x01, [0x407] = 0x01, [0x40B] = 0x01,
+    -- 0x02: z_isi01-03
+    [0x103] = 0x02, [0x614] = 0x02, [0x71C] = 0x02,
+    -- 0x03: z_isi201-203
+    [0x10A] = 0x03,
+    -- 0x04: z_isi301-303
+    [0x204] = 0x04, [0x208] = 0x04,
+    -- 0x05: z_isi301-303 with the attack and idle groans swapped
+    [0x714] = 0x05,
+    -- 0x06: z_k01-03, z_haki, z_sanj
+    [0x101] = 0x06, [0x10B] = 0x06, [0x20E] = 0x06,
+    -- 0x07: z_k01-03
+    [0x71B] = 0x07,
+    -- 0x08: z_mika01-03
+    [0x104] = 0x08, [0x105] = 0x08,
+    -- 0x09: z_simo01-03
+    [0x111] = 0x09, [0x401] = 0x09, [0x611] = 0x09,
+    -- 0x0A: z_suzu01-03, z_haki, z_sanj
+    [0x201] = 0x0A, [0x207] = 0x0A,
+    -- 0x0B: z_suzu01-03
+    [0x71A] = 0x0B,
+    -- 0x0C: ze_tomo1-3 with the ze_* body sounds
+    [0x503] = 0x0C, [0x50C] = 0x0C,
+}
+
 -- ---------------------------------------------------------------------------
 -- Constants
 -- ---------------------------------------------------------------------------

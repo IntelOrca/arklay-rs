@@ -6,6 +6,9 @@
 
 local yawn = require("./em0d")
 
+-- The first fight's sounds (`enemy/em0d_*`).
+sounds = "em0d"
+
 function update(e)
     yawn.update(e)
 end

@@ -935,6 +935,10 @@ end
 
 local STATES = { init, run, build, shoot_state }
 
+-- The WebSpinner's sounds (`enemy/em03_*`), with the tiger's own spit
+-- (`enemy/em04_08`) in place of the spinner's.
+sounds = "em03"
+
 function update(e)
     -- The state machine and the SCA pass run only while monsters are
     -- unpaused; the tiger's SCA tail is unconditional inside the gate.

@@ -50,6 +50,8 @@ mod imp {
         budget: Rc<crate::lua::Budget>,
         /// Compiled `update` functions, one per scripted id.
         scripts: HashMap<u8, Function>,
+        /// The `sounds` declaration of every loaded script, keyed by id.
+        sounds: HashMap<u8, EnemySounds>,
         /// Ids the pack carries no script for; the pack is asked once.
         missing: HashSet<u8>,
         /// Ids whose script failed to load or whose call errored.
@@ -84,6 +86,7 @@ mod imp {
                 lua: None,
                 budget: Rc::new(crate::lua::Budget::default()),
                 scripts: HashMap::new(),
+                sounds: HashMap::new(),
                 missing: HashSet::new(),
                 failed: HashSet::new(),
                 pack: Rc::new(Cell::new(std::ptr::null())),
@@ -102,6 +105,7 @@ mod imp {
             self.lua = None;
             self.budget = Rc::new(crate::lua::Budget::default());
             self.scripts.clear();
+            self.sounds.clear();
             self.missing.clear();
             self.failed.clear();
             self.modules = Rc::new(RefCell::new(HashMap::new()));
@@ -242,8 +246,57 @@ mod imp {
                     return None;
                 }
             };
+            match EnemySounds::parse(env.get::<Value>("sounds")) {
+                Ok(sounds) => {
+                    self.sounds.insert(id, sounds);
+                }
+                Err(err) => eprintln!("[enemy] {path} has an invalid sounds declaration: {err}"),
+            }
             self.scripts.insert(id, update.clone());
             Some(update)
+        }
+
+        /// The pack stems tried, in order, for enemy sound slot `slot` of
+        /// entity id `id` in room `room` (`stage << 8 | room`).
+        ///
+        /// The enemy's own set `em{id:02x}` comes first, then every set its
+        /// script's `sounds.base` chain inherits; a base naming another enemy
+        /// id (`em00`) follows that enemy's own declaration in turn. The style
+        /// is the `sounds.styles[room]` of the first set in the chain that
+        /// declares a `styles` table. Loads the scripts on first use; an id
+        /// with no script plays its own set only.
+        pub fn enemy_sound_stems(
+            &mut self,
+            pack: &Pack,
+            id: u8,
+            room: u16,
+            slot: u8,
+        ) -> Vec<String> {
+            self.pack.set(pack as *const Pack);
+            let mut sets = vec![format!("em{id:02x}")];
+            let mut style: Option<Option<u8>> = None;
+            let mut next = Some(id);
+            while let Some(id) = next.take() {
+                let _ = self.function(pack, id);
+                let Some(sounds) = self.sounds.get(&id) else {
+                    break;
+                };
+                if style.is_none() {
+                    style = sounds
+                        .styles
+                        .as_ref()
+                        .map(|styles| styles.get(&room).copied());
+                }
+                let Some(base) = &sounds.base else {
+                    break;
+                };
+                if sets.contains(base) || sets.len() >= MAX_SOUND_CHAIN {
+                    break;
+                }
+                sets.push(base.clone());
+                next = enemy_set_id(base);
+            }
+            crate::sfx::enemy_sound_stems(&sets, style.flatten(), slot)
         }
 
         /// Create the VM when the first script loads.
@@ -262,6 +315,59 @@ mod imp {
             self.budget = budget;
             true
         }
+    }
+
+    /// The longest `sounds.base` chain followed, own set included.
+    const MAX_SOUND_CHAIN: usize = 8;
+
+    /// A script's `sounds` declaration: the sound set it inherits and the
+    /// per-room styles it selects.
+    ///
+    /// `sounds = "em00"` inherits `em00`'s sounds; the table form
+    /// `sounds = { base = "em00", styles = { [0x103] = 0x02 } }` also picks
+    /// the style id each room (`stage << 8 | room`) plays.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    struct EnemySounds {
+        base: Option<String>,
+        styles: Option<HashMap<u16, u8>>,
+    }
+
+    impl EnemySounds {
+        fn parse(value: mlua::Result<Value>) -> mlua::Result<Self> {
+            match value? {
+                Value::Nil => Ok(Self::default()),
+                Value::String(base) => Ok(Self {
+                    base: Some(base.to_str()?.to_string()),
+                    styles: None,
+                }),
+                Value::Table(table) => {
+                    let base = table.get::<Option<String>>("base")?;
+                    let styles = table
+                        .get::<Option<Table>>("styles")?
+                        .map(|styles| {
+                            styles
+                                .pairs::<u16, u8>()
+                                .collect::<mlua::Result<HashMap<_, _>>>()
+                        })
+                        .transpose()?;
+                    Ok(Self { base, styles })
+                }
+                other => Err(mlua::Error::runtime(format!(
+                    "expected a string or a table, got {}",
+                    other.type_name()
+                ))),
+            }
+        }
+    }
+
+    /// The entity id a sound set names when it is another enemy's own set
+    /// (`em0d` is id 0x0D); `None` for any other set.
+    fn enemy_set_id(set: &str) -> Option<u8> {
+        let hex = set.strip_prefix("em")?;
+        if hex.len() != 2 {
+            return None;
+        }
+        u8::from_str_radix(hex, 16).ok()
     }
 
     /// The pack entry of id `id`'s script.
@@ -2908,16 +3014,14 @@ mod imp {
             // `Snd_em(id)`: queue the entity's group-offset enemy-bank cue at
             // the entity position. The sound-group nibble comes from the
             // spawn record's variant byte; an id at or above ten, or a record
-            // past the 48-entry bank, queues nothing.
+            // past the 48-entry bank, queues nothing. The sound is the
+            // enemy's own slot `id` (see `sounds` in the module docs).
             methods.add_method_mut("play_enemy_sound", |_lua, api, id: i64| {
-                let room = api.room;
                 let slot = api.slot;
                 let game = api.game();
-                let group = (game.entities[slot].variant >> 4) & 0x7;
-                // SAFETY: the room pointer borrows the caller's room for the
-                // whole call (see the type-level comment).
-                let room = unsafe { &*room };
-                if let Some((name, column)) = crate::sfx::enemy_sound(room, id as u8, group) {
+                let entity = &game.entities[slot];
+                let group = (entity.variant >> 4) & 0x7;
+                if let Some((name, column)) = crate::sfx::enemy_sound(entity.id, id as u8, group) {
                     let pos = game.entities[slot].pos;
                     game.entity_sounds.push(EntitySound {
                         name,
@@ -2946,7 +3050,7 @@ mod imp {
                     let game = api.game();
                     let pos = game.entities[slot].pos;
                     game.entity_sounds.push(EntitySound {
-                        name,
+                        name: name.into(),
                         bank,
                         column,
                         pos,
@@ -2971,7 +3075,7 @@ mod imp {
                     let game = api.game();
                     let pos = game.entities[slot].pos;
                     game.entity_sounds.push(EntitySound {
-                        name,
+                        name: name.into(),
                         bank,
                         column,
                         pos,
@@ -3880,7 +3984,7 @@ mod imp {
                         crate::sfx::play_3d_cue(room, character, bank as u8, id as u8)
                     {
                         api.game().entity_sounds.push(EntitySound {
-                            name,
+                            name: name.into(),
                             bank,
                             column,
                             pos: [x as i32, y as i32, z as i32],
@@ -4942,6 +5046,106 @@ mod tests {
             writer.add(path, source.as_bytes().to_vec()).unwrap();
         }
         Pack::from_bytes(writer.to_bytes().unwrap()).unwrap()
+    }
+
+    /// The original spawns that load each enemy, `(entity id, room, sound
+    /// group)`: every shipped enemy spawn whose room table carries that
+    /// enemy's own sounds. Spawns where the room's table names another
+    /// enemy's sounds (a hunter swapped into a zombie room on a later visit)
+    /// or nothing are left out: the port plays the enemy's own sounds there.
+    #[rustfmt::skip]
+    const SHIPPED_SPAWNS: &[(u8, u16, u8)] = &[
+        (0x00, 0x10E, 0), (0x00, 0x202, 0), (0x00, 0x20B, 0), (0x00, 0x60E, 0), (0x00, 0x716, 0),
+        (0x00, 0x101, 0), (0x00, 0x10B, 0), (0x00, 0x20E, 0), (0x00, 0x107, 0), (0x00, 0x407, 0),
+        (0x00, 0x40B, 0), (0x00, 0x111, 0), (0x00, 0x401, 0), (0x00, 0x611, 0), (0x00, 0x103, 0),
+        (0x00, 0x71C, 0), (0x00, 0x503, 0), (0x00, 0x50C, 0), (0x00, 0x201, 0), (0x00, 0x71B, 1),
+        (0x01, 0x505, 0), (0x01, 0x509, 0), (0x02, 0x108, 0), (0x02, 0x114, 0), (0x02, 0x11A, 0),
+        (0x02, 0x300, 0), (0x02, 0x302, 0), (0x02, 0x304, 0), (0x03, 0x404, 0), (0x03, 0x608, 0),
+        (0x04, 0x30C, 0), (0x05, 0x117, 0), (0x05, 0x212, 0), (0x05, 0x617, 0), (0x05, 0x712, 0),
+        (0x06, 0x601, 0), (0x06, 0x603, 0), (0x06, 0x604, 0), (0x06, 0x609, 0), (0x06, 0x60A, 0),
+        (0x06, 0x60B, 0), (0x06, 0x612, 0), (0x06, 0x61A, 0), (0x06, 0x701, 0), (0x06, 0x702, 0),
+        (0x06, 0x704, 0), (0x06, 0x706, 0), (0x06, 0x707, 0), (0x06, 0x308, 0), (0x06, 0x309, 0),
+        (0x06, 0x30A, 0), (0x06, 0x30B, 0), (0x07, 0x405, 0), (0x07, 0x408, 0), (0x08, 0x40C, 0),
+        (0x09, 0x505, 1), (0x09, 0x50F, 0), (0x09, 0x510, 0), (0x09, 0x511, 0), (0x0A, 0x301, 0),
+        (0x0A, 0x30D, 0), (0x0B, 0x40E, 0), (0x0C, 0x513, 0), (0x0D, 0x210, 0), (0x0F, 0x10C, 0),
+        (0x0F, 0x400, 0), (0x10, 0x303, 0), (0x11, 0x104, 0), (0x11, 0x105, 0), (0x11, 0x204, 0),
+        (0x11, 0x208, 0), (0x11, 0x614, 0), (0x11, 0x71C, 0), (0x11, 0x708, 0), (0x11, 0x713, 0),
+        (0x11, 0x10A, 0), (0x11, 0x112, 0), (0x11, 0x207, 0), (0x11, 0x503, 0), (0x11, 0x714, 0),
+        (0x11, 0x71A, 1), (0x11, 0x71B, 1), (0x12, 0x70C, 0),
+    ];
+
+    /// The checked-in enemy scripts' `sounds` declarations, resolved against
+    /// the converter's enemy sound sets, reproduce every shipped spawn's room
+    /// table: the per-room styles stand in for the original's tables.
+    #[test]
+    fn enemy_sounds_reproduce_the_shipped_room_tables() {
+        use crate::sfx::{ENEMY_DIR, ENEMY_SOUNDS, room_row, room_sound};
+        let files: std::collections::HashMap<String, &str> = ENEMY_SOUNDS
+            .iter()
+            .flat_map(|(set, slots)| {
+                slots
+                    .iter()
+                    .map(move |(slot, name)| (format!("{ENEMY_DIR}/{set}_{slot:02x}"), *name))
+            })
+            .collect();
+        let pack = pack(crate::enemy::ENEMY_SCRIPTS);
+        let mut host = LuaEnemyHost::new();
+        for &(id, room, group) in SHIPPED_SPAWNS {
+            let row = room_row((room >> 8) as u8, room as u8);
+            for slot in 0..10u8 {
+                let shipped = room_sound(row, usize::from(group * 10 + slot));
+                let resolved = host
+                    .enemy_sound_stems(&pack, id, room, slot)
+                    .iter()
+                    .find_map(|stem| files.get(stem).copied());
+                assert_eq!(
+                    resolved, shipped,
+                    "em{id:02x} in room {room:03X} slot {slot}"
+                );
+            }
+        }
+        assert_eq!(host.failed_scripts(), 0);
+    }
+
+    #[test]
+    fn enemy_sound_stems_follow_the_sounds_declaration() {
+        let pack = pack(&[
+            (
+                "enemy/em40.lua",
+                "sounds = { base = 'em41', styles = { [0x105] = 0x2b } }\nfunction update(e) end",
+            ),
+            (
+                "enemy/em41.lua",
+                "sounds = '/shared/beast'\nfunction update(e) end",
+            ),
+            ("enemy/em42.lua", "sounds = 7\nfunction update(e) end"),
+        ]);
+        let mut host = LuaEnemyHost::new();
+        assert_eq!(
+            host.enemy_sound_stems(&pack, 0x40, 0x105, 3),
+            [
+                "enemy/em40_2b_03",
+                "enemy/em40_03",
+                "enemy/em41_2b_03",
+                "enemy/em41_03",
+                "shared/beast_2b_03",
+                "shared/beast_03"
+            ]
+        );
+        // A room the styles table does not list plays the default sets.
+        assert_eq!(
+            host.enemy_sound_stems(&pack, 0x40, 0x106, 3),
+            ["enemy/em40_03", "enemy/em41_03", "shared/beast_03"]
+        );
+        // An invalid declaration and an id with no script play their own set.
+        assert_eq!(
+            host.enemy_sound_stems(&pack, 0x42, 0x105, 0),
+            ["enemy/em42_00"]
+        );
+        assert_eq!(
+            host.enemy_sound_stems(&pack, 0x43, 0x105, 0),
+            ["enemy/em43_00"]
+        );
     }
 
     /// The checked-in spider web script, so the tests exercise the real port.
@@ -7435,7 +7639,7 @@ end
         let mut expected = 1u32;
         let _floor = crate::game::platform_rand(&mut expected) & 1;
         let _ceiling = crate::game::platform_rand(&mut expected) & 1;
-        let expected_sound = crate::sfx::enemy_sound(&adder_room(), 0, 0).is_some();
+        let expected_sound = crate::sfx::enemy_sound(0x07, 0, 0).is_some();
 
         assert!(wasp_step(&mut host, &mut game, &pack, &clips));
         let entity = &game.entities[1];
@@ -7805,7 +8009,7 @@ end
         game.entities[0].move_speed_current = 5;
         game.entities[1].move_speed_current = 0;
         game.entities[1].set_wasp_distance(wasp_distance(&game));
-        let expected_sound = crate::sfx::enemy_sound(&adder_room(), 2, 0).is_some();
+        let expected_sound = crate::sfx::enemy_sound(0x07, 2, 0).is_some();
         assert!(wasp_step(&mut host, &mut game, &pack, &clips));
         let wasp = &game.entities[1];
         assert_eq!(wasp.health, -4);

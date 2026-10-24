@@ -1202,12 +1202,45 @@ fn special_light_suppressed(id: RoomId, camera: usize) -> bool {
     id.stage == LABORATORY_STAGE && id.room == ROOM_LABORATORY_ENTRY
 }
 
+/// The sound an [`EntitySound`] plays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SoundName {
+    /// A named room/global sound, played from `se/{name}.wav`.
+    Room(&'static str),
+    /// Enemy sound slot `slot` of entity id `id`. The engine resolves it
+    /// through the enemy's own sound files (see
+    /// [`crate::sfx::enemy_sound_stems`]) when the cue plays.
+    Enemy { id: u8, slot: u8 },
+}
+
+impl SoundName {
+    /// The room sound name, or `None` for an enemy sound slot.
+    pub fn room(self) -> Option<&'static str> {
+        match self {
+            SoundName::Room(name) => Some(name),
+            SoundName::Enemy { .. } => None,
+        }
+    }
+}
+
+impl From<&'static str> for SoundName {
+    fn from(name: &'static str) -> Self {
+        SoundName::Room(name)
+    }
+}
+
+impl PartialEq<&str> for SoundName {
+    fn eq(&self, other: &&str) -> bool {
+        matches!(self, SoundName::Room(name) if name == other)
+    }
+}
+
 /// One 3D entity sound cue queued by an NPC handler (the original's
-/// `PlayEntitySnd`), already resolved to a room sound name and position.
+/// `PlayEntitySnd`), already resolved to a sound and position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EntitySound {
-    /// Room sound name resolved from the footstep zone.
-    pub name: &'static str,
+    /// The sound to play: a room sound name or an enemy sound slot.
+    pub name: SoundName,
     /// The mixer bank the cue plays through: 0 room SFX, 1 weapon/menu,
     /// 2 enemy/room table, 3 character table.
     pub bank: u8,
