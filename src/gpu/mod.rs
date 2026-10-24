@@ -1,9 +1,10 @@
-//! The optional SDL_GPU hardware renderer for the gameplay scene.
+//! The SDL_GPU hardware renderer for the gameplay scene and the default.
 //!
 //! The software rasterizer in [`crate::render`] stays authoritative: the
 //! oracle, the goldens, `--capture`, `--trace`, `--stats` and every test draw
-//! through it. This renderer is an interactive-only alternative selected with
-//! `--renderer gpu`. It draws the same [`GameplayScene`] at the window's
+//! through it. This renderer is an interactive-only alternative selected by
+//! default (or explicitly with `--renderer gpu`). It draws the same
+//! [`GameplayScene`] at the window's
 //! resolution (see [`crate::video`]): the scene target is the viewport's size
 //! times `render_scale` percent, optionally multisampled (`msaa`), and is
 //! filtered into the viewport when the two differ.
@@ -291,7 +292,7 @@ pub struct GpuRenderer {
     retiring: bool,
     /// The entries the scene being recorded created.
     fresh: Vec<Upload>,
-    /// Whether presentation uses mailbox, which never waits for vsync; the
+    /// Whether the swapchain uses mailbox, which never waits for vsync; the
     /// caller's frame pacing ([`crate::pacer`]) then sets the present rate.
     mailbox: bool,
 }
@@ -321,25 +322,48 @@ impl GpuRenderer {
         }
         renderer.window = window;
         renderer.follow_window()?;
-        // FIFO presentation can block indefinitely on a compositor that
-        // stops sending frame callbacks (a hidden or unmapped Wayland
-        // window), which would also stop the event loop. Mailbox never
-        // waits; the loop's frame pacer limits presents to `frame_rate`.
-        if unsafe {
-            SDL_WindowSupportsGPUPresentMode(renderer.device, window, SDL_GPU_PRESENTMODE_MAILBOX)
-        } && unsafe {
-            SDL_SetGPUSwapchainParameters(
-                renderer.device,
-                window,
-                SDL_GPU_SWAPCHAINCOMPOSITION_SDR,
-                SDL_GPU_PRESENTMODE_MAILBOX,
-            )
-        } {
-            renderer.mailbox = true;
-        }
+        // SDL starts a claimed window in FIFO (vsync) presentation. The
+        // caller applies `set_vsync` for an explicit off preference.
         let format = unsafe { SDL_GetGPUSwapchainTextureFormat(renderer.device, window) };
         renderer.pipelines.composite = renderer.composite_pipeline(format)?;
         Ok(renderer)
+    }
+
+    /// Select vsync (FIFO) or the lowest-latency present mode the window
+    /// supports. Returns false when SDL rejects every candidate, in which
+    /// case the current mode stays in force.
+    pub fn set_vsync(&mut self, vsync: bool) -> bool {
+        if self.window.is_null() {
+            return false;
+        }
+        // Without vsync, prefer immediate present (tearing) and fall back to
+        // mailbox; both never wait for the compositor, and the frame pacer
+        // still limits presents to `frame_rate`.
+        let modes = if vsync {
+            [SDL_GPU_PRESENTMODE_VSYNC; 3]
+        } else {
+            [
+                SDL_GPU_PRESENTMODE_IMMEDIATE,
+                SDL_GPU_PRESENTMODE_MAILBOX,
+                SDL_GPU_PRESENTMODE_VSYNC,
+            ]
+        };
+        let count = if vsync { 1 } else { modes.len() };
+        for &mode in &modes[..count] {
+            if unsafe {
+                SDL_WindowSupportsGPUPresentMode(self.device, self.window, mode)
+                    && SDL_SetGPUSwapchainParameters(
+                        self.device,
+                        self.window,
+                        SDL_GPU_SWAPCHAINCOMPOSITION_SDR,
+                        mode,
+                    )
+            } {
+                self.mailbox = mode == SDL_GPU_PRESENTMODE_MAILBOX;
+                return true;
+            }
+        }
+        false
     }
 
     /// Give the window back once in-flight work is done, so an SDL renderer

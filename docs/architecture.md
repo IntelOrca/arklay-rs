@@ -390,6 +390,10 @@ Without a usable device (the shaders are SPIR-V, so it needs Vulkan) the
 window warns and falls back to software; a failure while drawing or
 presenting does the same mid-game.
 
+- **Presentation.** `vsync` (on by default) selects SDL_GPU's FIFO present
+  mode; off prefers IMMEDIATE, then MAILBOX, and the frame pacer sets the
+  rate. The software backend applies the same option through
+  `SDL_SetRenderVSync`.
 - **Resolutions.** Every frame is the 320x240 one; only its presentation
   varies. The window's client area is `window_width` x `window_height`
   (F8 sets whole multiples of the presented frame), or the

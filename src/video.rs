@@ -409,6 +409,8 @@ pub struct Graphics {
     pub render_scale: u32,
     /// The GPU scene target's samples per pixel.
     pub msaa: u32,
+    /// Wait for the display's refresh before presenting the next frame.
+    pub vsync: bool,
     /// Presented frames per second; the simulation stays at [`TICK_RATE`].
     pub frame_rate: u32,
     /// The display aspect ratio: 4:3 or a wider crop.
@@ -425,6 +427,7 @@ impl Default for Graphics {
             display: 1,
             render_scale: 100,
             msaa: 1,
+            vsync: true,
             frame_rate: TICK_RATE,
             aspect: Aspect::STANDARD,
         }
@@ -583,6 +586,7 @@ mod tests {
     fn the_gpu_renderer_is_the_default() {
         assert_eq!(Graphics::default().renderer, RendererKind::Gpu);
         assert_eq!(RendererKind::default(), RendererKind::Gpu);
+        assert!(Graphics::default().vsync);
     }
 
     #[test]

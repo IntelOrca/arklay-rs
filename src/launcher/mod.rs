@@ -278,11 +278,12 @@ const UPDATE_ITEMS: [&str; 6] = [
 ];
 
 /// The launcher's `OPTIONS` rows, in display order.
-const OPTIONS_ITEMS: [&str; 10] = [
+const OPTIONS_ITEMS: [&str; 11] = [
     "RENDERER",
     "WIDESCREEN",
     "RESOLUTION",
     "FULLSCREEN",
+    "VSYNC",
     "LANGUAGE",
     "RENDER SCALE",
     "MSAA",
@@ -290,6 +291,10 @@ const OPTIONS_ITEMS: [&str; 10] = [
     "QUICK TURN",
     "TACTICAL RELOAD",
 ];
+
+/// The `OPTIONS` row whose change is applied to the live backend rather than
+/// to the window.
+const OPTION_VSYNC: usize = 4;
 
 /// Window sizes at the 4:3 aspect, from 3x to 8x the 320x240 frame.
 const RESOLUTIONS_STANDARD: [(u32, u32); 5] = [
@@ -569,7 +574,7 @@ impl Launcher {
                 }
             }
             Screen::Update => "ENTER SELECT   LEFT/RIGHT CHANGE   ESC BACK",
-            Screen::Mods => "SPACE TOGGLE   CTRL+UP/DOWN MOVE   O FOLDER   ESC BACK",
+            Screen::Mods => "SPACE TOGGLE   CTRL+UP/DOWN MOVE (DOWN=HIGHER)   O FOLDER   ESC BACK",
             Screen::Options => "LEFT/RIGHT CHANGE   ENTER NEXT   ESC BACK",
             Screen::Progress => {
                 if self.confirm_cancel {
@@ -850,7 +855,16 @@ impl Launcher {
     fn draw_mods(&mut self) {
         self.grid
             .draw(&mut self.frame, 3, 4, "MODS - RESIDENT EVIL", Color::BODY);
-        self.table_header(5, &[(4, "ON"), (9, "MOD"), (46, "ID"), (68, "VERSION")]);
+        self.table_header(
+            5,
+            &[
+                (4, "PRIORITY"),
+                (14, "ON"),
+                (18, "MOD"),
+                (46, "ID"),
+                (68, "VERSION"),
+            ],
+        );
         if self.mods.is_empty() {
             self.grid
                 .draw(&mut self.frame, 7, 4, "NO MODS DISCOVERED.", Color::DIM);
@@ -868,22 +882,40 @@ impl Launcher {
             self.mods_index = self.mods.len() - 1;
         }
         let mods = self.mods.clone();
+        let total = mods.len();
         for (index, row) in mods.iter().enumerate() {
             let line = 7 + index;
             let selected = index == self.mods_index;
             let mark = if row.enabled { "[x]" } else { "[ ]" };
+            let priority = if total == 1 {
+                "ONLY"
+            } else if index == 0 {
+                "LOWEST"
+            } else if index + 1 == total {
+                "HIGHEST"
+            } else {
+                "MID"
+            };
             self.table_row(
                 line,
                 selected,
                 &[
-                    (4, mark),
-                    (9, &truncate(&row.name, 34)),
+                    (4, priority),
+                    (14, mark),
+                    (18, &truncate(&row.name, 27)),
                     (46, &truncate(&row.id, 20)),
                     (68, &truncate(&row.version, 9)),
                 ],
             );
             self.hits.push((line, index));
         }
+        self.grid.draw(
+            &mut self.frame,
+            19,
+            4,
+            "APPLIED TOP TO BOTTOM: LOWEST PRIORITY FIRST, HIGHEST LAST.",
+            Color::DIM,
+        );
         if let Some(row) = self.mods.get(self.mods_index) {
             self.grid.draw(
                 &mut self.frame,
@@ -914,11 +946,12 @@ impl Launcher {
             1 => "16:9 crops the frame; off keeps the original 4:3 view.",
             2 => "Windowed client size. Fullscreen uses the display's desktop size.",
             3 => "Borderless fullscreen. Alt+Enter also toggles it while playing.",
-            4 => "Game text language. System follows the OS locale.",
-            5 => "GPU only: scene resolution as a percentage of the viewport.",
-            6 => "GPU only: anti-aliasing samples. Higher is smoother and slower.",
-            7 => "Presented frames per second. The game logic still ticks at 30 Hz.",
-            8 => "Classic REbirth quick turn: BACKWARD + RUN turns 180 degrees.",
+            4 => "Wait for the display refresh; off allows tearing and lower latency.",
+            5 => "Game text language. System follows the OS locale.",
+            6 => "GPU only: scene resolution as a percentage of the viewport.",
+            7 => "GPU only: anti-aliasing samples. Higher is smoother and slower.",
+            8 => "Presented frames per second. The game logic still ticks at 30 Hz.",
+            9 => "Classic REbirth quick turn: BACKWARD + RUN turns 180 degrees.",
             _ => "Classic REbirth tactical reload: AIM + RUN reloads a partial clip.",
         };
         self.grid
@@ -1256,7 +1289,13 @@ impl Launcher {
     /// Change the selected `OPTIONS` row, applying window changes immediately
     /// and persisting every choice.
     fn change_option(&mut self, delta: isize, display: &mut Display) {
-        if change_option(&mut self.config, self.options_index, delta) {
+        let window = change_option(&mut self.config, self.options_index, delta);
+        if self.options_index == OPTION_VSYNC {
+            if let Err(err) = display.set_vsync(self.config.graphics.vsync) {
+                logging::write(&format!("warning: vsync not applied: {err:#}"));
+                eprintln!("warning: vsync not applied: {err:#}");
+            }
+        } else if window {
             self.apply_window(display);
         }
         self.save_options();
@@ -2098,11 +2137,12 @@ fn option_value(config: &Config, index: usize) -> String {
         ),
         2 => resolution_label(graphics),
         3 => on_off(graphics.fullscreen),
-        4 => language_label(config.language.as_deref()),
-        5 => format!("{}%", graphics.render_scale),
-        6 => format!("{}x", graphics.msaa),
-        7 => format!("{} FPS", graphics.frame_rate),
-        8 => on_off(config.game.quick_turn),
+        4 => on_off(graphics.vsync),
+        5 => language_label(config.language.as_deref()),
+        6 => format!("{}%", graphics.render_scale),
+        7 => format!("{}x", graphics.msaa),
+        8 => format!("{} FPS", graphics.frame_rate),
+        9 => on_off(config.game.quick_turn),
         _ => on_off(config.game.tactical_reload),
     }
 }
@@ -2138,24 +2178,28 @@ fn change_option(config: &mut Config, index: usize, delta: isize) -> bool {
             true
         }
         4 => {
-            step_language(config, delta);
+            config.graphics.vsync = !config.graphics.vsync;
             false
         }
         5 => {
+            step_language(config, delta);
+            false
+        }
+        6 => {
             config.graphics.render_scale =
                 step_value(&RENDER_SCALES, config.graphics.render_scale, delta);
             false
         }
-        6 => {
+        7 => {
             config.graphics.msaa = step_value(&video::MSAA_COUNTS, config.graphics.msaa, delta);
             false
         }
-        7 => {
+        8 => {
             config.graphics.frame_rate =
                 video::step_frame_rate(config.graphics.frame_rate, delta as i32);
             false
         }
-        8 => {
+        9 => {
             config.game.quick_turn = !config.game.quick_turn;
             false
         }
@@ -2648,6 +2692,9 @@ mod tests {
         assert_eq!(option_value(&config, 0), "GPU");
         assert_eq!(option_value(&config, 1), "OFF (4:3)");
         assert_eq!(option_value(&config, 2), "960x720 (3x)");
+        assert_eq!(option_value(&config, 4), "ON");
+        assert_eq!(option_value(&config, 9), "ON");
+        assert_eq!(option_value(&config, 10), "ON");
 
         assert!(!change_option(&mut config, 0, 1));
         assert_eq!(config.graphics.renderer, RendererKind::Software);
@@ -2675,18 +2722,24 @@ mod tests {
         assert!(!config.graphics.fullscreen);
 
         assert!(!change_option(&mut config, 4, 1));
-        assert_eq!(config.language.as_deref(), Some("en-US"));
-        assert_eq!(option_value(&config, 4), "ENGLISH (en-US)");
+        assert!(!config.graphics.vsync);
+        assert_eq!(option_value(&config, 4), "OFF");
+        change_option(&mut config, 4, 1);
+        assert!(config.graphics.vsync);
+
         assert!(!change_option(&mut config, 5, 1));
-        assert_eq!(config.graphics.render_scale, 150);
+        assert_eq!(config.language.as_deref(), Some("en-US"));
+        assert_eq!(option_value(&config, 5), "ENGLISH (en-US)");
         assert!(!change_option(&mut config, 6, 1));
-        assert_eq!(config.graphics.msaa, 2);
+        assert_eq!(config.graphics.render_scale, 150);
         assert!(!change_option(&mut config, 7, 1));
-        assert_eq!(config.graphics.frame_rate, 60);
+        assert_eq!(config.graphics.msaa, 2);
         assert!(!change_option(&mut config, 8, 1));
-        assert!(config.game.quick_turn);
+        assert_eq!(config.graphics.frame_rate, 60);
         assert!(!change_option(&mut config, 9, 1));
-        assert!(config.game.tactical_reload);
+        assert!(!config.game.quick_turn);
+        assert!(!change_option(&mut config, 10, 1));
+        assert!(!config.game.tactical_reload);
 
         // A custom window size is labelled as such and steps to the first
         // preset in the chosen direction.

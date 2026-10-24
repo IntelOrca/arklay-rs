@@ -1125,7 +1125,12 @@ impl Display {
             // SAFETY: the window outlives the backend (field order) and has
             // no SDL renderer yet.
             match unsafe { GpuRenderer::new(window.0, graphics.render_scale, graphics.msaa) } {
-                Ok(gpu) => Some(gpu),
+                Ok(mut gpu) => {
+                    if !gpu.set_vsync(graphics.vsync) {
+                        eprintln!("warning: vsync setting not applied; using the default mode");
+                    }
+                    Some(gpu)
+                }
                 Err(err) => {
                     eprintln!("warning: GPU renderer unavailable ({err:#}); using software");
                     None
@@ -1136,7 +1141,7 @@ impl Display {
         };
         let backend = match gpu {
             Some(gpu) => Backend::Gpu(Box::new(gpu)),
-            None => Self::software_backend(window.0)?,
+            None => Self::software_backend(window.0, graphics.vsync)?,
         };
         Ok(Self {
             backend,
@@ -1172,6 +1177,27 @@ impl Display {
         let display = unsafe { SDL_GetDisplayForWindow(window) };
         place_window(window, graphics, display);
         self.save_window();
+    }
+
+    /// Change V-Sync for the current backend and remember it.
+    pub(crate) fn set_vsync(&mut self, vsync: bool) -> Result<()> {
+        if let Some(graphics) = self.graphics.as_mut() {
+            graphics.vsync = vsync;
+        }
+        match &mut self.backend {
+            Backend::Software { renderer, .. } => {
+                if !unsafe { SDL_SetRenderVSync(renderer.0, if vsync { 1 } else { 0 }) } {
+                    bail!("SDL_SetRenderVSync failed: {}", sdl_error());
+                }
+            }
+            Backend::Gpu(gpu) => {
+                if !gpu.set_vsync(vsync) {
+                    bail!("SDL_SetGPUSwapchainParameters failed: {}", sdl_error());
+                }
+            }
+            Backend::None => {}
+        }
+        Ok(())
     }
 
     /// Apply the launcher's window options (aspect, size or fullscreen) to
@@ -1259,13 +1285,13 @@ impl Display {
     }
 
     /// The SDL renderer and streaming texture of the software backend.
-    fn software_backend(window: *mut SDL_Window) -> Result<Backend> {
+    fn software_backend(window: *mut SDL_Window, vsync: bool) -> Result<Backend> {
         let renderer = unsafe { SDL_CreateRenderer(window, std::ptr::null()) };
         if renderer.is_null() {
             bail!("SDL_CreateRenderer failed: {}", sdl_error());
         }
         let renderer = RendererHandle(renderer);
-        let _ = unsafe { SDL_SetRenderVSync(renderer.0, 1) };
+        let _ = unsafe { SDL_SetRenderVSync(renderer.0, i32::from(vsync)) };
 
         let texture = FrameTexture::new(renderer.0, WIDTH as u32, HEIGHT as u32)?;
         if !unsafe { SDL_SetRenderDrawColor(renderer.0, 0, 0, 0, 255) } {
@@ -1299,14 +1325,19 @@ impl Display {
             self.backend = if want_gpu {
                 match unsafe { GpuRenderer::new(self.window, graphics.render_scale, graphics.msaa) }
                 {
-                    Ok(gpu) => Backend::Gpu(Box::new(gpu)),
+                    Ok(mut gpu) => {
+                        if !gpu.set_vsync(graphics.vsync) {
+                            eprintln!("warning: vsync setting not applied; using the default mode");
+                        }
+                        Backend::Gpu(Box::new(gpu))
+                    }
                     Err(err) => {
                         eprintln!("warning: GPU renderer unavailable ({err:#}); using software");
-                        Self::software_backend(self.window)?
+                        Self::software_backend(self.window, graphics.vsync)?
                     }
                 }
             } else {
-                Self::software_backend(self.window)?
+                Self::software_backend(self.window, graphics.vsync)?
             };
         }
         let Some(current) = self.graphics.as_mut() else {
@@ -1369,7 +1400,8 @@ impl Display {
         if let Backend::Gpu(gpu) = &mut self.backend {
             gpu.release_window();
         }
-        self.backend = Self::software_backend(self.window)?;
+        let vsync = self.graphics.as_ref().is_none_or(|graphics| graphics.vsync);
+        self.backend = Self::software_backend(self.window, vsync)?;
         Ok(())
     }
 

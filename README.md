@@ -35,9 +35,11 @@ Steam's RE1 install, creates or refreshes `games/re1.akpak`, plays a pack in
 the same window (closing the game window ends the process), discovers mods
 across the data roots and remembers their enable/disable state and order, and
 checks the release and nightly update tracks. The OPTIONS screen edits the
-renderer, widescreen, resolution, fullscreen, language, GPU render scale and
-MSAA, frame rate, quick turn and tactical reload, writing every change back to
-`arklay.toml`.
+renderer, widescreen, resolution, fullscreen, V-Sync, language, GPU render
+scale and MSAA, frame rate, quick turn and tactical reload, writing every
+change back to `arklay.toml`. MODS shows the application order: the top row is
+applied first (lowest priority) and the bottom row last (highest); Ctrl+Down
+moves a mod toward higher priority.
 
 Updates publish a small `build.json` next to the platform binary. `release`
 follows the latest normal release; `nightly` follows the rolling pre-release
@@ -181,9 +183,9 @@ cargo run -- re1.akpak --render-scale 150 --msaa 4
 cargo run -- re1.akpak --room 100
 cargo run -- re1.akpak --ui debug --capture debug.bmp
 
-# Classic REbirth tactical reload for one run: with a gun aimed, hold RUN to
-# reload instead of firing (or set [game] tactical_reload = true in arklay.toml)
-cargo run -- re1.akpak --room 100 --tactical-reload
+# Classic REbirth tactical reload is on by default: with a gun aimed, hold RUN
+# to reload instead of firing. Turn it off for one run with:
+cargo run -- re1.akpak --room 100 --no-tactical-reload
 ```
 
 Captures, assembled scripts and converted packs are written to a sibling
@@ -264,9 +266,8 @@ would not shrink also stays raw.
 
 ### Gameplay options
 
-`arklay.toml` also reads a `[game]` table of optional behaviours. Each is off
-unless set, so a default configuration plays, traces and captures exactly as
-before.
+`arklay.toml` also reads a `[game]` table of optional behaviours. Both are on
+by default; a trace or capture still keeps them off so its output is unchanged.
 
 ```toml
 [game]
@@ -367,6 +368,7 @@ table of `arklay.toml`, so the next run opens the same way on the same screen:
 [graphics]
 renderer = "gpu"   # "gpu" (default) or "software"; --renderer overrides it
 fullscreen = false # borderless fullscreen (Alt+Enter)
+vsync = true       # wait for the display refresh; false allows tearing
 window_width = 960 # the window's client size in pixels (F8 sets multiples
 window_height = 720 # of 320x240); a window too big for its display shrinks
 display = 1        # the display to open on, numbered from 1
@@ -381,11 +383,15 @@ original's 30 Hz, so input timing, scripts and traces are identical at every
 rate. Above 30 each frame draws the characters, objects, shadows, effect
 sprites and room fades between the last two ticks (one tick behind, like any
 interpolation); camera cuts, room loads, teleports, door transitions, films
-and the 2D screens snap. Any rate from 30 to 1000 is accepted, though vsync
-caps it at the display's refresh rate; the title, menus and door transitions,
-which tick every 16 ms, present once per tick (about 62 fps) at any rate below
-that. The F1 menu's DISPLAY tool steps it through 30,
-60, 120, 144, 165 and 240 and saves the choice.
+and the 2D screens snap. Any rate from 30 to 1000 is accepted, though V-Sync
+caps it at the display's refresh rate when on; the title, menus and door
+transitions, which tick every 16 ms, present once per tick (about 62 fps) at
+any rate below that. The F1 menu's DISPLAY tool steps it through 30, 60, 120,
+144, 165 and 240 and saves the choice.
+
+`vsync` (on by default) waits for the display refresh before presenting.
+Turning it off lets the frame pacer own the rate and may tear, which can feel
+more responsive.
 
 `aspect` (also `--aspect` and the F1 DISPLAY tool) presents a wider frame by
 cropping the 320x240 view rather than pillarboxing it. In a room the visible

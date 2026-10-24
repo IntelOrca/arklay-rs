@@ -22,7 +22,8 @@
 //! [bindings]
 //! aim = ["key:C", "mouse:right", "axis:lefttrigger+"]
 //!
-//! # Gameplay options (`--quick-turn` and `--tactical-reload` override them).
+//! # Gameplay options, both on by default (`--quick-turn` and
+//! # `--tactical-reload` override them; `--no-...` turns one off for a run).
 //! [game]
 //! quick_turn = true      # BACKWARD + RUN turns the player 180 degrees
 //! tactical_reload = true # AIM + RUN reloads a partially loaded gun
@@ -34,6 +35,7 @@
 //! renderer = "gpu"       # or "software"; `--renderer` overrides it
 //!                        # (GPU is the default and falls back to software)
 //! fullscreen = false     # borderless fullscreen
+//! vsync = true           # wait for the display refresh before presenting
 //! window_width = 960     # the window's client size in pixels (F8 picks
 //! window_height = 720    # multiples of 320x240; any size is letterboxed)
 //! display = 1            # the display to open on, from 1
@@ -191,17 +193,25 @@ pub struct Games {
 }
 
 /// The `[game]` gameplay options.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Game {
     /// Classic REbirth's quick turn: a RUN press while walking backward
-    /// turns the player 180 degrees in place over eight ticks. Off by
-    /// default, like the reference's `[DLL] QuickTurn`.
+    /// turns the player 180 degrees in place over eight ticks. On by default.
     pub quick_turn: bool,
     /// Classic REbirth's tactical reload (`[DLL] TactReload`): with the aim
     /// held, holding RUN reloads the equipped gun instead of firing when the
-    /// clip is not full and the matching ammunition item is held. Off by
+    /// clip is not full and the matching ammunition item is held. On by
     /// default.
     pub tactical_reload: bool,
+}
+
+impl Default for Game {
+    fn default() -> Self {
+        Self {
+            quick_turn: true,
+            tactical_reload: true,
+        }
+    }
 }
 
 /// The table the parser is in.
@@ -689,6 +699,13 @@ fn parse_graphics_key(graphics: &mut Graphics, key: &str, value: &str, line: usi
                 _ => bail!("line {line}: `fullscreen` expects true or false"),
             };
         }
+        "vsync" => {
+            graphics.vsync = match value {
+                "true" => true,
+                "false" => false,
+                _ => bail!("line {line}: `vsync` expects true or false"),
+            };
+        }
         "window_width" => graphics.window_width = integer(1..=video::MAX_WINDOW_SIDE)?,
         "window_height" => graphics.window_height = integer(1..=video::MAX_WINDOW_SIDE)?,
         "display" => graphics.display = integer(1..=video::MAX_DISPLAY)?,
@@ -911,6 +928,9 @@ fn render_graphics(graphics: &Graphics) -> String {
     }
     if graphics.fullscreen != defaults.fullscreen {
         out.push_str(&format!("fullscreen = {}\n", graphics.fullscreen));
+    }
+    if graphics.vsync != defaults.vsync {
+        out.push_str(&format!("vsync = {}\n", graphics.vsync));
     }
     if graphics.aspect != defaults.aspect {
         out.push_str(&format!("aspect = {}\n", quote(&graphics.aspect.name())));
@@ -1261,6 +1281,7 @@ mod tests {
             "[graphics]\n\
              renderer = \"gpu\"\n\
              fullscreen = true  # borderless\n\
+             vsync = false\n\
              window_width = 1280\n\
              window_height = 1024\n\
              display = 2\n\
@@ -1280,6 +1301,7 @@ mod tests {
                 display: 2,
                 render_scale: 150,
                 msaa: 4,
+                vsync: false,
                 frame_rate: 75,
                 aspect: video::Aspect::WIDE,
             }
@@ -1290,6 +1312,7 @@ mod tests {
         // Keys left out keep their defaults, and defaults are not written.
         let config = Config::parse("[graphics]\nwindow_width = 640\n").unwrap();
         assert_eq!(config.graphics.msaa, 1);
+        assert!(config.graphics.vsync);
         assert_eq!(config.graphics.window_height, 720);
         assert_eq!(config.render(), "[graphics]\nwindow_width = 640\n");
     }
@@ -1308,7 +1331,7 @@ mod tests {
             "[graphics]\nmsaa = 3\n",
             "[graphics]\nframe_rate = 29\n",
             "[graphics]\nframe_rate = 1001\n",
-            "[graphics]\nvsync = true\n",
+            "[graphics]\nvsync = 1\n",
             "[graphics]\nmsaa = 1\nmsaa = 2\n",
             "[graphics]\n[graphics]\n",
         ] {
@@ -1352,36 +1375,31 @@ mod tests {
     fn a_game_table_sets_the_gameplay_options() {
         let config = Config::parse("[game]\nquick_turn = true  # BACKWARD + RUN\n").unwrap();
         assert!(config.game.quick_turn);
-        let text = config.render();
-        assert_eq!(text, "[game]\nquick_turn = true\n");
-        assert_eq!(Config::parse(&text).unwrap(), config);
-        // The default is off and is not written.
-        assert!(!Config::parse("").unwrap().game.quick_turn);
-        assert_eq!(Config::default().render(), "");
-        assert_eq!(
-            Config::parse("[game]\nquick_turn = false\n")
-                .unwrap()
-                .render(),
-            ""
-        );
+        // Both behaviours are on by default, so an explicit `true` is not
+        // written back.
+        assert_eq!(config.render(), "");
+        assert_eq!(Config::parse(&config.render()).unwrap(), config);
+        let config = Config::parse("[game]\nquick_turn = false\n").unwrap();
+        assert!(!config.game.quick_turn);
+        assert_eq!(config.render(), "[game]\nquick_turn = false\n");
+        assert_eq!(Config::parse(&config.render()).unwrap(), config);
         // The tactical reload is the second `[game]` behaviour and renders in
         // the table's key order.
         let config = Config::parse("[game]\ntactical_reload = true\n").unwrap();
         assert!(config.game.tactical_reload);
-        assert_eq!(config.render(), "[game]\ntactical_reload = true\n");
+        assert_eq!(config.render(), "");
         assert_eq!(Config::parse(&config.render()).unwrap(), config);
         let config = Config::parse("[game]\nquick_turn = true\ntactical_reload = true\n").unwrap();
+        assert_eq!(config.render(), "");
+        let config =
+            Config::parse("[game]\nquick_turn = false\ntactical_reload = false\n").unwrap();
         assert_eq!(
             config.render(),
-            "[game]\nquick_turn = true\ntactical_reload = true\n"
+            "[game]\nquick_turn = false\ntactical_reload = false\n"
         );
-        assert!(!Config::parse("").unwrap().game.tactical_reload);
-        assert_eq!(
-            Config::parse("[game]\ntactical_reload = false\n")
-                .unwrap()
-                .render(),
-            ""
-        );
+        assert_eq!(Config::parse(&config.render()).unwrap(), config);
+        assert!(Config::parse("").unwrap().game.quick_turn);
+        assert!(Config::parse("").unwrap().game.tactical_reload);
     }
 
     #[test]
@@ -1397,8 +1415,8 @@ mod tests {
             assert!(Config::parse(text).is_err(), "{text:?} must be rejected");
             let (config, warnings) = Config::parse_lenient(text);
             assert!(!warnings.is_empty(), "{text:?} must warn");
-            assert!(!config.game.quick_turn, "{text:?}");
-            assert!(!config.game.tactical_reload, "{text:?}");
+            assert!(config.game.quick_turn, "{text:?}");
+            assert!(config.game.tactical_reload, "{text:?}");
         }
         // A duplicate key warns and keeps the first value.
         for (key, value) in [
@@ -1499,6 +1517,7 @@ mod tests {
             display: 2,
             render_scale: 200,
             msaa: 8,
+            vsync: false,
             frame_rate: 120,
             aspect: video::Aspect::WIDE,
         };
@@ -1542,6 +1561,7 @@ mod tests {
             display: 2,
             render_scale: 150,
             msaa: 4,
+            vsync: false,
             frame_rate: 144,
             aspect: video::Aspect::WIDE,
         };
