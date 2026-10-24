@@ -27,15 +27,20 @@ pub const GLYPH_HEIGHT: i32 = 14;
 /// Width at which a sheet selects the 14px Japanese metrics.
 pub const JPN_SHEET_WIDTH: u32 = 768;
 
-/// The default sheet entry: whatever font the converted install ships, the
-/// Japanese `FONT.TIM` or the Western `fontus.tim`.
+/// The default sheet entry: the Japanese `FONT.TIM` when the converted
+/// install ships it, otherwise [`WESTERN_SHEET`].
 pub const DEFAULT_ENTRY: &str = "font/font.tim";
 /// The Japanese sheet as a script-specific override, packed when the install
 /// carries a Western default too.
 pub const JAPANESE_ENTRY: &str = "font/jpn.tim";
-/// The Western sheet as a script-specific override, packed when the install
-/// carries a Japanese default.
+/// The Western sheet as a script-specific override: always
+/// [`WESTERN_SHEET`].
 pub const LATIN_ENTRY: &str = "font/latin.tim";
+/// Classic REbirth's Western sheet (its `DATA/PBFONT0.TIM`), which every
+/// pack carries as [`LATIN_ENTRY`]: the Japanese sheet's 14px cells with the
+/// kana replaced by accented Latin, drawn at CR's proportional advances. HD
+/// packs made for CR replace this sheet, not the releases' `fontus.tim`.
+pub const WESTERN_SHEET: &[u8] = include_bytes!("../games/re1/font/latin.tim");
 /// The default sheet's pack stem, the key a replacement resolves by.
 pub const DEFAULT_STEM: &str = "font/font";
 
@@ -84,8 +89,12 @@ pub fn load_session(pack: &Pack, script: crate::charset::Script) -> Option<Font>
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FontMetrics {
     /// Glyph advance: 14 for the 768-wide Japanese sheet, 8 for the 256-wide
-    /// USA sheet.
+    /// Western sheet (the original's `fontus.tim` pitch, which Classic
+    /// REbirth's sheet keeps as its default advance).
     pub glyph_w: i32,
+    /// The sheet's cell pitch: 14 on both sheets. Classic REbirth's Western
+    /// sheet lays its glyphs out in the Japanese sheet's cells.
+    pub cell_w: i32,
     /// Left margin of a message box.
     pub left_margin: i32,
     /// Room-message y.
@@ -96,12 +105,14 @@ pub struct FontMetrics {
 
 impl FontMetrics {
     /// Select the metrics from the sheet width: 768-wide selects 14px glyphs
-    /// with margin `0x22`; anything narrower uses the USA 8px metrics with
-    /// margin `0x30`. Both share the room-message y `181` and menu y `186`.
+    /// with margin `0x22`; anything narrower is Classic REbirth's Western
+    /// sheet, 14px cells laid out at the USA 8px metrics with margin `0x30`.
+    /// Both share the room-message y `181` and menu y `186`.
     pub fn from_sheet_width(width: u32) -> Self {
         if width >= JPN_SHEET_WIDTH {
             Self {
                 glyph_w: 14,
+                cell_w: 14,
                 left_margin: 0x22,
                 text_y: 181,
                 menu_y: 186,
@@ -109,6 +120,7 @@ impl FontMetrics {
         } else {
             Self {
                 glyph_w: 8,
+                cell_w: 14,
                 left_margin: 0x30,
                 text_y: 181,
                 menu_y: 186,
@@ -199,6 +211,31 @@ impl GlyphTable {
             }
         }
         table.apply_authored_rules();
+        table
+    }
+
+    /// Classic REbirth's proportional metrics for its Western sheet: every
+    /// plain cell advances the default 8px but for the cells
+    /// [`crate::charset::western_widths`] lists. The digits keep the default,
+    /// so counters stay monospaced.
+    pub fn western(texture: &Texture8, metrics: FontMetrics) -> Self {
+        let rows = (texture.height as i32 / GLYPH_HEIGHT).max(0) as usize;
+        let full = GlyphMetric::full(metrics.glyph_w);
+        let mut table = Self {
+            glyph_w: metrics.glyph_w,
+            pages: [vec![full; rows * PAGE_COLUMNS], Vec::new()],
+        };
+        for &(byte, width, indent) in crate::charset::western_widths() {
+            table.set(
+                0,
+                plain_row(byte),
+                plain_col(byte),
+                GlyphMetric {
+                    indent: i32::from(indent),
+                    advance: i32::from(width),
+                },
+            );
+        }
         table
     }
 
@@ -415,7 +452,7 @@ impl<'a> Glyphs<'a> {
     /// one is selected, else the full cell.
     fn metric(&self, u: i32, v: i32) -> GlyphMetric {
         match self.table {
-            Some(table) => table.at(u, v, self.metrics.glyph_w),
+            Some(table) => table.at(u, v, self.metrics.cell_w),
             None => GlyphMetric::full(self.metrics.glyph_w),
         }
     }
@@ -425,7 +462,7 @@ impl<'a> Glyphs<'a> {
         Glyph {
             u,
             v,
-            width: self.metrics.glyph_w,
+            width: self.metrics.cell_w,
             height: GLYPH_HEIGHT,
             advance: metric.advance,
             missing: false,
@@ -495,7 +532,7 @@ impl Iterator for Glyphs<'_> {
                         0xF9 => (256, row * GLYPH_HEIGHT),
                         _ => (256, (row + 14) * GLYPH_HEIGHT),
                     };
-                    return Some(self.glyph(page + col * self.metrics.glyph_w, v));
+                    return Some(self.glyph(page + col * self.metrics.cell_w, v));
                 }
                 _ => {
                     self.position += 1;
@@ -513,12 +550,19 @@ impl Glyphs<'_> {
         // The original's `PrintText8x14` — which reads an ASCII buffer, not
         // the game-text encoding — draws ASCII '(' and ')' as the sheet's
         // round parentheses. Only the ASCII grid sets the flag.
+        // The Western sheet keeps them in the plain grid's 0x05/0x06 cells.
         if self.remap_parentheses {
+            let western = self.metrics.glyph_w < self.metrics.cell_w;
+            let cells = if western {
+                [(5 * self.metrics.cell_w, 28), (6 * self.metrics.cell_w, 28)]
+            } else {
+                [(56, 224), (70, 224)]
+            };
             if byte == 0x28 {
-                return self.glyph(56, 224);
+                return self.glyph(cells[0].0, cells[0].1);
             }
             if byte == 0x29 {
-                return self.glyph(70, 224);
+                return self.glyph(cells[1].0, cells[1].1);
             }
         }
         let byte = i32::from(byte);
@@ -529,7 +573,7 @@ impl Glyphs<'_> {
         } else {
             0
         };
-        self.glyph(col * self.metrics.glyph_w, bias + row * GLYPH_HEIGHT)
+        self.glyph(col * self.metrics.cell_w, bias + row * GLYPH_HEIGHT)
     }
 }
 
@@ -556,7 +600,11 @@ impl Font {
     pub fn new(texture: Texture8) -> Self {
         let metrics = FontMetrics::from_sheet_width(texture.width);
         let missing = missing_box_texture(&texture, metrics.glyph_w);
-        let glyph_table = GlyphTable::measure(&texture, metrics.glyph_w);
+        let glyph_table = if texture.width >= JPN_SHEET_WIDTH {
+            GlyphTable::measure(&texture, metrics.cell_w)
+        } else {
+            GlyphTable::western(&texture, metrics)
+        };
         Self {
             texture,
             metrics,
@@ -582,9 +630,9 @@ impl Font {
     fn glyphs<'a>(&'a self, tight: bool, bytes: &'a [u8]) -> Glyphs<'a> {
         let glyphs = Glyphs::new(bytes, self.metrics);
         // The tight table compensates for the Japanese sheet's full-width
-        // Latin glyphs. The Western sheet was drawn at its own 8px advances
-        // by the original, so it ignores the flag and every cell is whole.
-        if tight && self.script() == crate::charset::Script::Japanese {
+        // Latin glyphs. The Western sheet always draws at Classic REbirth's
+        // proportional advances, which its table carries.
+        if tight || self.script() == crate::charset::Script::Latin {
             glyphs.tight(&self.glyph_table)
         } else {
             glyphs
@@ -1383,14 +1431,16 @@ mod tests {
     }
 
     #[test]
-    fn usa_extended_glyphs_use_eight_pixel_columns() {
+    fn western_glyphs_sit_in_fourteen_pixel_cells() {
+        // Classic REbirth's sheet keeps the Japanese 14px grid; only the
+        // advance is narrower.
         let f8 = steps(&[0xF8, 20], metrics_usa());
-        assert_eq!(f8[0].u, 16);
+        assert_eq!(f8[0].u, 28);
         assert_eq!(f8[0].v, 224);
-        assert_eq!(f8[0].width, 8);
+        assert_eq!(f8[0].width, 14);
 
         let plain = steps(&[0x1D], metrics_usa());
-        assert_eq!(plain[0].u, 88);
+        assert_eq!(plain[0].u, 11 * 14);
         assert_eq!(plain[0].v, 42);
     }
 
@@ -1447,33 +1497,28 @@ mod tests {
     }
 
     #[test]
-    fn the_western_sheet_ignores_the_tight_flag() {
+    fn the_western_sheet_uses_classic_rebirths_widths() {
         // The tight table compensates for the Japanese sheet's full-width
-        // Latin glyphs. The Western sheet was drawn whole by the original, so
-        // a narrow cell keeps its 8px advance even when the language asks for
-        // tight metrics (issue #32).
-        let width = 256u32;
-        let height = 256u32;
-        let mut indices = vec![0u8; (width * height) as usize];
-        // `I` is plain cell 0x25: row 2, column 1 -> u 8, v 28 + 2*14.
-        for y in 56..56 + GLYPH_HEIGHT {
-            for x in 10..=12 {
-                indices[(y as u32 * width + x as u32) as usize] = 1;
-            }
-        }
-        let mut palettes = vec![[0u8; 4]; crate::model::PALETTE_ROW_LEN];
-        palettes[1] = [255, 255, 255, 255];
+        // Latin glyphs. The Western sheet's advances come from Classic
+        // REbirth's width table instead, whatever the tight flag says, and
+        // never from the ink (issue #32, #63).
         let font = Font::new(Texture8 {
-            width,
-            height,
-            indices,
-            palettes,
+            width: 256,
+            height: 256,
+            indices: vec![0; 256 * 256],
+            palettes: vec![[0u8; 4]; crate::model::PALETTE_ROW_LEN],
             stp: Vec::new(),
         });
         assert_eq!(font.script(), crate::charset::Script::Latin);
         assert_eq!(font.metrics.glyph_w, 8);
-        assert_eq!(font.advance(true, &[0x25]), 8, "the Western sheet is whole");
-        assert_eq!(font.advance(false, &[0x25]), 8);
+        // `I` is plain cell 0x25: CR draws it 2px left and advances 5.
+        assert_eq!(font.advance(true, &[0x25]), 5);
+        assert_eq!(font.advance(false, &[0x25]), 5);
+        let i: Vec<Glyph> = font.glyphs(false, &[0x25]).collect();
+        assert_eq!((i[0].u, i[0].v), (14, 56));
+        assert_eq!(i[0].indent, 2);
+        // `A` (0x1D) keeps the default 8px advance.
+        assert_eq!(font.advance(false, &[0x1D]), 8);
 
         // The same strip on the Japanese sheet is trimmed to its ink.
         let jpn = Font::new(sheet_with_ink(&[(14, 56, 2, 4)]));

@@ -1,50 +1,46 @@
-//! The 256-wide Western sheet's game-text map (`Data/fontus.tim`).
+//! The Western game-text map: Classic REbirth's sheet (`font/latin.tim`).
 //!
-//! The European and North American releases ship the same 256x256 4bpp sheet
-//! the Japanese `FONT.TIM` replaces: the same 18-column game-text grid at
-//! `v = 28`, but with 8px cells and a different byte assignment. Where the
-//! Japanese sheet spends rows 3..7 on kana, this one spells the accented
-//! Latin letters the European releases need (`ÄÖÜäöüßÀÂÈÉÊÏÎÔÙÛÇç`), and its
-//! punctuation cells differ too: `,` is `0x18` here against `0x17` on the
-//! Japanese sheet, `;` is `0x17` against `0x16`, and `(`, `\`, `)` sit at
-//! `0x37..0x39` where the Japanese sheet has `[`, `/`, `]`.
+//! Classic REbirth draws every Western language with its own sheet,
+//! `DATA/PBFONT0.TIM`, which ships here as `games/re1/font/latin.tim`: the
+//! Japanese `FONT.TIM` left page's 14px cells, with the kana rows replaced by
+//! accented Latin letters. Its byte assignment is the Western releases'
+//! `fontus.tim` one for everything those sheets share (`,` is `0x18`, `;`
+//! `0x17`, `Ä` `0x57`, the `S.`/`T.`/`A.`/`R.` ligatures `0x74..=0x77`), with
+//! three moves — `(`/`)` at `0x05`/`0x06`, `«`/`»` at `0x09`/`0x0A`, and the
+//! Japanese sheet's `[`, `/`, `]` at `0x37..=0x39` where `fontus.tim` has
+//! `(`, `\`, `)` — and the Spanish, Nordic and other letters it adds at
+//! `0x7F..=0xA3`. The tables follow CR's own `encoding.xml`.
 //!
 //! The sheet is a single page: the `0xF9`/`0xFA` extended escapes have no
-//! cells here, and the only text the shipped USA/FRA/GER RDTs use is the
-//! plain grid (they carry no `0xF8` escape at all). The `S.`/`T.`/`A.`/`R.`
-//! ligature cells (which carry the trailing period) live in the plain grid at
-//! `0x74..=0x77`, and the seeds spell `S.T.A.R.S.` as the fullwidth
-//! `ＳＴＡＲＳ`, which maps to those same cells.
-//!
-//! The rows below are the decoded sheet: `LEFT` names each cell (rows 0..7
-//! are the game-text grid, row 8 is the 14px controller-symbol row, and the
-//! rest of the sheet is blank), `ENCODE_ONE`/`ENCODE_TWO` are the inverse
-//! map, and `SUBSTITUTIONS` aliases the characters the sheet has no cell for.
+//! cells here. `LEFT` names each plain cell, `ENCODE_ONE`/`ENCODE_TWO` are the
+//! inverse map, `SUBSTITUTIONS` aliases the characters the sheet has no cell
+//! for, and `WIDTHS` carries CR's proportional advances.
 
 /// plain byte b -> LEFT row b/18, col b%18; `""` marks a cell with no
-/// Unicode spelling (the controller symbols draw as raw bytes).
+/// Unicode spelling (the `0x02`/`0x0B` symbols and the `0x80..=0x83` fill
+/// pieces draw as raw bytes).
 #[rustfmt::skip]
 pub(super) static LEFT: [&str; 288] = [
-    // row 0 (the plain grid's first row; 0x02..=0x0B are the symbols)
-    " ", "", "", "", "", "", "", "", "", "", "", "", "0", "1", "2", "3", "4", "5",
+    // row 0
+    " ", "", "", "", "", "(", ")", "", "", "«", "»", "", "0", "1", "2", "3", "4", "5",
     // row 1
     "6", "7", "8", "9", ":", ";", ",", "”", "!", "?", "‽", "A", "B", "C", "D", "E", "F", "G",
     // row 2
     "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y",
     // row 3
-    "Z", "(", "\\", ")", "'", "-", "·", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k",
+    "Z", "[", "/", "]", "'", "-", "·", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k",
     // row 4
     "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "Ä", "ä", "Ö",
     // row 5
     "ö", "Ü", "ü", "ß", "À", "à", "Â", "â", "È", "è", "É", "é", "Ê", "ê", "Ï", "ï", "Î", "î",
     // row 6
-    "Ô", "ô", "Ù", "ù", "Û", "û", "Ç", "ç", "S.", "T.", "A.", "R.", "“", ".", "…", "–", "–", "+",
+    "Ô", "ô", "Ù", "ù", "Û", "û", "Ç", "ç", "S.", "T.", "A.", "R.", "“", ".", "…", "‒", "–", "+",
     // row 7
-    "=", " ", " ", " ", " ", " ", " ", " ", " ", " ", " ", " ", " ", " ", " ", " ", " ", " ",
-    // row 8 (the 14px controller-symbol row, no Unicode spelling)
-    "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+    "=", "&", "", "", "", "", "Ñ", "ñ", "Ë", "ë", "°", "ª", "Á", "á", "Í", "í", "Ó", "ó",
+    // row 8
+    "Ú", "ú", "¿", "¡", "Ì", "ì", "Ò", "ò", "$", "*", "„", "‟", "▲", "`", "Æ", "æ", "Ø", "ø",
     // row 9
-    "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+    "Å", "å", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
     // row 10
     "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
     // row 11
@@ -59,21 +55,24 @@ pub(super) static LEFT: [&str; 288] = [
     "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
 ];
 
-/// Character -> glyph bytes for the Western sheet's plain grid.
-/// Sorted by character; every entry's byte is a plain grid cell
-/// (`0x00..=0xF7`) the renderer samples at the 8px cell size.
+/// Character -> glyph bytes for the sheet's plain grid.
+/// Sorted by character; every entry's byte is a plain grid cell.
 #[rustfmt::skip]
-pub(super) static ENCODE_ONE: [(char, &[u8]); 116] = [
+pub(super) static ENCODE_ONE: [(char, &[u8]); 154] = [
     (' ', &[0x00]),
     ('!', &[0x1A]),
     ('"', &[0x19]),
+    ('$', &[0x98]),
+    ('&', &[0x7F]),
     ('\'', &[0x3A]),
-    ('(', &[0x37]),
-    (')', &[0x39]),
+    ('(', &[0x05]),
+    (')', &[0x06]),
+    ('*', &[0x99]),
     ('+', &[0x7D]),
     (',', &[0x18]),
     ('-', &[0x3B]),
     ('.', &[0x79]),
+    ('/', &[0x38]),
     ('0', &[0x0C]),
     ('1', &[0x0D]),
     ('2', &[0x0E]),
@@ -114,7 +113,9 @@ pub(super) static ENCODE_ONE: [(char, &[u8]); 116] = [
     ('X', &[0x34]),
     ('Y', &[0x35]),
     ('Z', &[0x36]),
-    ('\\', &[0x38]),
+    ('[', &[0x37]),
+    (']', &[0x39]),
+    ('`', &[0x9D]),
     ('a', &[0x3D]),
     ('b', &[0x3E]),
     ('c', &[0x3F]),
@@ -141,41 +142,73 @@ pub(super) static ENCODE_ONE: [(char, &[u8]); 116] = [
     ('x', &[0x54]),
     ('y', &[0x55]),
     ('z', &[0x56]),
+    ('\u{a1}', &[0x93]),
+    ('\u{aa}', &[0x89]),
+    ('\u{ab}', &[0x09]),
+    ('\u{b0}', &[0x88]),
     ('\u{b7}', &[0x3C]),
+    ('\u{bb}', &[0x0A]),
+    ('\u{bf}', &[0x92]),
     ('\u{c0}', &[0x5E]),
+    ('\u{c1}', &[0x8A]),
     ('\u{c2}', &[0x60]),
     ('\u{c4}', &[0x57]),
+    ('\u{c5}', &[0xA2]),
+    ('\u{c6}', &[0x9E]),
     ('\u{c7}', &[0x72]),
     ('\u{c8}', &[0x62]),
     ('\u{c9}', &[0x64]),
     ('\u{ca}', &[0x66]),
+    ('\u{cb}', &[0x86]),
+    ('\u{cc}', &[0x94]),
+    ('\u{cd}', &[0x8C]),
     ('\u{ce}', &[0x6A]),
     ('\u{cf}', &[0x68]),
+    ('\u{d1}', &[0x84]),
+    ('\u{d2}', &[0x96]),
+    ('\u{d3}', &[0x8E]),
     ('\u{d4}', &[0x6C]),
     ('\u{d6}', &[0x59]),
+    ('\u{d8}', &[0xA0]),
     ('\u{d9}', &[0x6E]),
+    ('\u{da}', &[0x90]),
     ('\u{db}', &[0x70]),
     ('\u{dc}', &[0x5B]),
     ('\u{df}', &[0x5D]),
     ('\u{e0}', &[0x5F]),
+    ('\u{e1}', &[0x8B]),
     ('\u{e2}', &[0x61]),
     ('\u{e4}', &[0x58]),
+    ('\u{e5}', &[0xA3]),
+    ('\u{e6}', &[0x9F]),
     ('\u{e7}', &[0x73]),
     ('\u{e8}', &[0x63]),
     ('\u{e9}', &[0x65]),
     ('\u{ea}', &[0x67]),
+    ('\u{eb}', &[0x87]),
+    ('\u{ec}', &[0x95]),
+    ('\u{ed}', &[0x8D]),
     ('\u{ee}', &[0x6B]),
     ('\u{ef}', &[0x69]),
+    ('\u{f1}', &[0x85]),
+    ('\u{f2}', &[0x97]),
+    ('\u{f3}', &[0x8F]),
     ('\u{f4}', &[0x6D]),
     ('\u{f6}', &[0x5A]),
+    ('\u{f8}', &[0xA1]),
     ('\u{f9}', &[0x6F]),
+    ('\u{fa}', &[0x91]),
     ('\u{fb}', &[0x71]),
     ('\u{fc}', &[0x5C]),
-    ('\u{2013}', &[0x7B]),
+    ('\u{2012}', &[0x7B]),
+    ('\u{2013}', &[0x7C]),
     ('\u{201c}', &[0x78]),
     ('\u{201d}', &[0x19]),
+    ('\u{201e}', &[0x9A]),
+    ('\u{201f}', &[0x9B]),
     ('\u{2026}', &[0x7A]),
     ('\u{203d}', &[0x1C]),
+    ('\u{25b2}', &[0x9C]),
     ('\u{ff21}', &[0x76]),
     ('\u{ff32}', &[0x77]),
     ('\u{ff33}', &[0x74]),
@@ -194,32 +227,77 @@ pub(super) static ENCODE_TWO: [(&str, &[u8]); 4] = [
 ];
 
 /// Characters with no cell of their own that localized text still uses;
-/// each maps to the closest cell the Western sheet draws. Sorted by
-/// character; no target is itself a substitution key.
-///
-/// `/` is the load-bearing one: the Western sheet has no slash cell, but the
-/// releases use one as the save screen's field separator — the USA art spells
-/// it `\` (`SaveLoadScreen.cpp`'s `"     \  \"`) where the Japanese sheet
-/// spells it `/` — so a `/` in Latin text draws the sheet's backslash.
+/// each maps to the closest cell the sheet draws. Sorted by character; no
+/// target is itself a substitution key.
 #[rustfmt::skip]
-pub(super) static SUBSTITUTIONS: [(char, &str); 19] = [
-    ('/', "\\"),
+pub(super) static SUBSTITUTIONS: [(char, &str); 15] = [
+    ('\\', "/"),
     ('_', "-"),
-    ('\u{ab}', "“"),
-    ('\u{bb}', "”"),
     ('\u{2010}', "-"),
     ('\u{2011}', "-"),
-    ('\u{2012}', "–"),
     ('\u{2014}', "–"),
     ('\u{2018}', "'"),
     ('\u{2019}', "'"),
-    ('\u{201e}', "“"),
-    ('\u{201f}', "“"),
     ('\u{2022}', "·"),
     ('\u{2027}', "·"),
-    ('\u{2039}', "“"),
-    ('\u{203a}', "”"),
+    ('\u{2039}', "«"),
+    ('\u{203a}', "»"),
     ('\u{2212}', "-"),
     ('\u{3000}', " "),
     ('\u{30fc}', "-"),
+    ('\u{ff3f}', "-"),
+];
+
+/// Classic REbirth's per-glyph `(byte, width, indent)` for the cells whose
+/// advance is not the default 8px: the cell draws shifted left by `indent`
+/// and the cursor advances by `width`.
+#[rustfmt::skip]
+pub(super) static WIDTHS: [(u8, u8, u8); 47] = [
+    (0x02, 14, 0),
+    (0x05, 5, 3),
+    (0x06, 5, 0),
+    (0x09, 7, 6),
+    (0x0A, 7, 1),
+    (0x0B, 14, 0),
+    (0x16, 4, 2),
+    (0x17, 4, 2),
+    (0x18, 4, 2),
+    (0x19, 7, 0),
+    (0x1A, 3, 2),
+    (0x1B, 7, 0),
+    (0x25, 5, 2),
+    (0x26, 7, 0),
+    (0x37, 5, 3),
+    (0x39, 5, 3),
+    (0x3A, 4, 0),
+    (0x3B, 7, 0),
+    (0x3C, 7, 0),
+    (0x45, 5, 2),
+    (0x46, 4, 2),
+    (0x48, 5, 2),
+    (0x49, 7, 0),
+    (0x4E, 7, 0),
+    (0x4F, 7, 0),
+    (0x50, 6, 1),
+    (0x54, 7, 0),
+    (0x68, 5, 2),
+    (0x69, 5, 2),
+    (0x6A, 5, 2),
+    (0x6B, 5, 2),
+    (0x78, 7, 0),
+    (0x79, 4, 0),
+    (0x7E, 7, 0),
+    (0x88, 5, 0),
+    (0x89, 7, 0),
+    (0x8C, 5, 2),
+    (0x8D, 5, 2),
+    (0x92, 7, 0),
+    (0x93, 3, 2),
+    (0x94, 5, 2),
+    (0x95, 5, 2),
+    (0x9A, 7, 0),
+    (0x9B, 7, 0),
+    (0x9D, 4, 2),
+    (0x9E, 11, 0),
+    (0x9F, 11, 0),
 ];

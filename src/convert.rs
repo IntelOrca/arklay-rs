@@ -1868,32 +1868,43 @@ fn copy_manifest(writer: &mut PackWriter, language: &str) -> Result<(usize, usiz
     Ok((1, bytes))
 }
 
-/// Add the game-text sheets raw: the install's own as `font/font.tim` and the
-/// other script's, when the install carries one, as `font/latin.tim` /
-/// `font/jpn.tim`. Both are 4bpp TIMs the engine decodes, so no conversion is
-/// needed.
+/// Add the game-text sheets raw: the install's own as `font/font.tim`, the
+/// Japanese sheet of a Western install as `font/jpn.tim`, and Classic
+/// REbirth's Western sheet ([`crate::font::WESTERN_SHEET`]) as
+/// `font/latin.tim`. A Western install's own `fontus.tim` is replaced by that
+/// sheet too: every Latin language draws with it. All are 4bpp TIMs the engine
+/// decodes, so no conversion is needed.
 fn copy_font(
     fonts: &Fonts,
     writer: &mut PackWriter,
     progress: &mut Progress,
 ) -> Result<(usize, usize)> {
+    let read = |path: &Path| -> Result<Vec<u8>> {
+        fs::read(path).with_context(|| format!("failed to read {}", path.display()))
+    };
+    let primary = match fonts.primary.as_deref() {
+        Some(path) if sheet_script_of(path) == crate::charset::Script::Latin => {
+            Some(crate::font::WESTERN_SHEET.to_vec())
+        }
+        Some(path) => Some(read(path)?),
+        None => None,
+    };
     let sheets = [
-        ("font/font.tim", fonts.primary.as_deref()),
-        ("font/latin.tim", fonts.latin.as_deref()),
-        ("font/jpn.tim", fonts.japanese.as_deref()),
+        ("font/font.tim", primary),
+        ("font/latin.tim", Some(crate::font::WESTERN_SHEET.to_vec())),
+        (
+            "font/jpn.tim",
+            fonts.japanese.as_deref().map(read).transpose()?,
+        ),
     ];
-    let packed = sheets.iter().filter(|(_, path)| path.is_some()).count();
-    if packed == 0 {
-        return Ok((0, 0));
-    }
+    let packed = sheets.iter().filter(|(_, data)| data.is_some()).count();
     let mut count = 0;
     let mut bytes = 0;
     progress.begin("font", packed as u64);
-    for (entry, path) in sheets {
-        let Some(path) = path else {
+    for (entry, data) in sheets {
+        let Some(data) = data else {
             continue;
         };
-        let data = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
         bytes += data.len();
         count += 1;
         writer
@@ -2034,26 +2045,25 @@ fn discover_layout(root: &Path) -> Result<Layout> {
 
 /// The game-text sheets a conversion packs.
 ///
-/// The install's own sheet is the pack's default (`font/font.tim`); a sheet
-/// of the other script — found under the conversion root or named on the
-/// command line — is packed as `font/<script>.tim`, so one pack can render
-/// both the Japanese and the Western text.
+/// The install's own sheet is the pack's default (`font/font.tim`); a
+/// Japanese sheet found beside a Western install — under the conversion root
+/// or named on the command line — is packed as `font/jpn.tim`, so one pack
+/// can render both scripts. The Western sheet always comes from the tree
+/// ([`crate::font::WESTERN_SHEET`]).
 #[derive(Debug, Default, Clone)]
 struct Fonts {
     /// The install's own sheet, packed as `font/font.tim`.
     primary: Option<PathBuf>,
-    /// The Western sheet (`fontus.tim`), packed as `font/latin.tim`.
-    latin: Option<PathBuf>,
     /// The Japanese sheet (`FONT.TIM`), packed as `font/jpn.tim`.
     japanese: Option<PathBuf>,
 }
 
 /// Resolve the sheets to pack: the chosen data directory's own font is the
-/// default, every other sheet the root carries becomes its script's override.
+/// default, and a Japanese sheet elsewhere under the root becomes the
+/// Japanese override.
 ///
-/// A sheet the root does not carry is a warning, not an error: a Japanese
-/// install alone renders Latin languages with the Japanese sheet's tight
-/// metrics, and a Steam tree alone renders Japanese with the Western sheet.
+/// A missing Japanese sheet is a warning, not an error: a Steam tree alone
+/// renders Japanese with the Western sheet.
 fn resolve_fonts(data: Option<&Path>, found: &[FontSheet]) -> (Fonts, Vec<String>) {
     let primary = data
         .and_then(|dir| found.iter().find(|sheet| sheet.path.parent() == Some(dir)))
@@ -2061,21 +2071,14 @@ fn resolve_fonts(data: Option<&Path>, found: &[FontSheet]) -> (Fonts, Vec<String
         .map(|sheet| sheet.path.clone());
     let mut fonts = Fonts {
         primary: primary.clone(),
-        latin: None,
         japanese: None,
     };
     for sheet in found {
         if Some(&sheet.path) == primary.as_ref() {
             continue;
         }
-        match sheet.script {
-            crate::charset::Script::Latin if fonts.latin.is_none() => {
-                fonts.latin = Some(sheet.path.clone());
-            }
-            crate::charset::Script::Japanese if fonts.japanese.is_none() => {
-                fonts.japanese = Some(sheet.path.clone());
-            }
-            _ => {}
+        if sheet.script == crate::charset::Script::Japanese && fonts.japanese.is_none() {
+            fonts.japanese = Some(sheet.path.clone());
         }
     }
     // Only diagnose a missing sheet when the install actually has a DATA
@@ -2090,13 +2093,6 @@ fn resolve_fonts(data: Option<&Path>, found: &[FontSheet]) -> (Fonts, Vec<String
         )),
         (_, Some(primary)) => {
             let primary = sheet_script_of(primary);
-            if primary != crate::charset::Script::Latin && fonts.latin.is_none() {
-                warnings.push(
-                    "no Western font sheet (Data/fontus.tim) found; Latin languages draw with \
-                     the Japanese sheet's tight metrics"
-                        .to_string(),
-                );
-            }
             if primary != crate::charset::Script::Japanese && fonts.japanese.is_none() {
                 warnings.push(
                     "no Japanese font sheet (DATA/FONT.TIM) found; Japanese text draws with \
@@ -5531,12 +5527,11 @@ mod tests {
             plan.fonts.primary.as_deref(),
             Some(data.join("FONT.TIM").as_path())
         );
-        assert_eq!(plan.fonts.latin, None);
         assert_eq!(plan.fonts.japanese, None);
         assert_eq!(plan.language, "ja-JP");
-        // The install carries no Western sheet: a warning, not an error.
+        // The Western sheet ships with the tree, so the install needs none.
         assert!(
-            plan.warnings.iter().any(|w| w.contains("fontus.tim")),
+            !plan.warnings.iter().any(|w| w.contains("fontus.tim")),
             "warnings: {:?}",
             plan.warnings
         );
@@ -5545,19 +5540,21 @@ mod tests {
         let mut progress = Progress::new("test", 1);
         let (count, bytes) = copy_font(&plan.fonts, &mut writer, &mut progress).unwrap();
 
-        assert_eq!((count, bytes), (1, 14));
+        let western = crate::font::WESTERN_SHEET;
+        assert_eq!((count, bytes), (2, 14 + western.len()));
         let pack = crate::pack::Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
         assert_eq!(
             pack.read("font/font.tim").unwrap().as_ref(),
             b"raw-font-sheet"
         );
+        assert_eq!(pack.read("font/latin.tim").unwrap().as_ref(), western);
     }
 
     #[test]
-    fn packs_the_other_scripts_sheet_beside_the_installs_own() {
+    fn packs_the_trees_western_sheet_in_place_of_fontus() {
         // A data directory carrying both sheets: the Japanese one is the
-        // default (the install's own room text is Japanese) and the Western
-        // one rides along as its override.
+        // default (the install's own room text is Japanese), and the Western
+        // override is Classic REbirth's sheet, not the install's `fontus.tim`.
         let root = TempDir::new("font-both");
         make_stage_dirs(&root.path);
         let data = root.path.join("DATA");
@@ -5571,10 +5568,6 @@ mod tests {
             Some(data.join("FONT.TIM").as_path())
         );
         assert_eq!(
-            plan.fonts.latin.as_deref(),
-            Some(data.join("fontus.tim").as_path())
-        );
-        assert_eq!(
             plan.fonts.japanese, None,
             "the primary is the Japanese sheet"
         );
@@ -5586,7 +5579,10 @@ mod tests {
         assert_eq!(count, 2);
         let pack = crate::pack::Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
         assert!(pack.contains("font/font.tim"));
-        assert!(pack.contains("font/latin.tim"));
+        assert_eq!(
+            pack.read("font/latin.tim").unwrap().as_ref(),
+            crate::font::WESTERN_SHEET
+        );
     }
 
     #[test]
@@ -5614,15 +5610,19 @@ mod tests {
             plan.fonts.japanese.as_deref(),
             Some(japanese.join("DATA/FONT.TIM").as_path())
         );
-        assert_eq!(plan.fonts.latin, None, "the primary is the Western sheet");
         assert_eq!(plan.language, "en-US");
 
         let mut writer = PackWriter::new();
         let mut progress = Progress::new("test", 1);
         let (count, _bytes) = copy_font(&plan.fonts, &mut writer, &mut progress).unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(count, 3);
         let pack = crate::pack::Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
-        assert!(pack.contains("font/font.tim"));
+        // The install's own `fontus.tim` gives way to the tree's sheet.
+        assert_eq!(
+            pack.read("font/font.tim").unwrap().as_ref(),
+            crate::font::WESTERN_SHEET
+        );
+        assert!(pack.contains("font/latin.tim"));
         assert!(pack.contains("font/jpn.tim"));
     }
 }

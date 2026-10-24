@@ -465,7 +465,7 @@ fn finish_mask(texel: u32) -> u32 {
 /// game uploads them (`DATA/STATUS.TIM`, `DATA/TITLE.PIX`, `DATA/PBFONT0.TIM`),
 /// as the hash of the Japanese page and of the English one. A pack made under
 /// CR names the English page, so a Japanese install also looks that hash up.
-const TRANSLATED: [(u32, u32); 3] = [
+const TRANSLATED: [(u32, u32); 4] = [
     // The status screen's menu page, CLUT row 0.
     (0x440c_318f, 0x97de_3e43),
     // The title screen.
@@ -474,6 +474,10 @@ const TRANSLATED: [(u32, u32); 3] = [
     // and CR's Western `PBFONT0.TIM`, whose cells hold the same glyphs but
     // for the hiragana block (see `crate::font`).
     (0xb2dc_eba5, 0xcff9_d54d),
+    // The same page from the copy of `PBFONT0.TIM` every pack carries as its
+    // Western sheet (`crate::font::WESTERN_SHEET`), which doesn't reproduce
+    // CR's hash of it either.
+    (0xc428_814d, 0xcff9_d54d),
 ];
 
 /// Append the English page's hash, with the same frame, after each candidate
@@ -946,6 +950,14 @@ mod tests {
             ..sheet
         };
         assert!(font_candidates(&short).is_empty());
+    }
+
+    #[test]
+    fn the_shipped_western_sheet_names_classic_rebirths_hd_font_page() {
+        let sheet = crate::tim::decode_4bpp(crate::font::WESTERN_SHEET).unwrap();
+        let hashes: Vec<u32> = font_candidates(&sheet).iter().map(|c| c.hash).collect();
+        assert!(hashes.contains(&0xc428_814d), "{hashes:08x?}");
+        assert!(hashes.contains(&0xcff9_d54d), "{hashes:08x?}");
     }
 
     #[test]
