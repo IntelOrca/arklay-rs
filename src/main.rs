@@ -730,6 +730,9 @@ fn write_pack_info(pack_path: &Path, pack: &Pack, out: &mut impl Write) -> Resul
             if let Some(engine) = &manifest.engine {
                 writeln!(out, "  engine: {engine}")?;
             }
+            if let Some(version) = manifest.convert_version {
+                writeln!(out, "  convert_version: {version}")?;
+            }
             writeln!(out, "  rdt: {}", manifest.rdt_version)?;
             writeln!(out, "  scd: {}", manifest.scd_version)?;
             if !manifest.lua.is_empty() {

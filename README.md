@@ -30,11 +30,10 @@ engine still resolves replacements by stem but refuses to decode those formats.
 ## Launcher
 
 Running `arklay` with no arguments opens the startup launcher. Naming a pack
-on the command line skips it and boots the game directly. The launcher locates
+on the command line skips it and boots the game directly. The launcher finds
 Steam's RE1 install, creates or refreshes `games/re1.akpak`, lists installed
-packs, toggles and reorders mods, and checks the release and nightly update
-channels. (The current branch is the launcher shell with placeholder data;
-detection and conversion land next.)
+packs and rebuilds a pack when the converter changes. Play, mod handling and
+the release/nightly updater are the next checkpoints.
 
 Data resolves by precedence:
 

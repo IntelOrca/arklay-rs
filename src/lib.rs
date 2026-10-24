@@ -64,6 +64,7 @@ pub mod speed;
 pub mod stairs;
 pub mod state;
 pub mod stats;
+pub mod steam;
 pub mod text;
 pub mod tim;
 pub mod tmd;

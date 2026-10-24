@@ -8,7 +8,7 @@
 //! is the default configuration. The grammar is the same small TOML subset the pack manifest
 //! uses — comments, blank lines and `key = "value"`, plus TOML's literal
 //! `key = 'value'` strings so a Windows path needs no escaping — with two
-//! root keys and four tables (the `[graphics]` table also takes bare integers
+//! root keys and five tables (the `[graphics]` table also takes bare integers
 //! and booleans, and so does `[game]`):
 //!
 //! ```toml
@@ -50,6 +50,12 @@
 //! enabled = ["hd", "demo"]
 //! disabled = ["balance"]
 //! order = ["demo", "hd"]
+//!
+//! # The launcher's remembered installation (written after a successful
+//! # install or rebuild, not usually edited by hand).
+//! [games]
+//! re1_source = 'C:\Games\Resident Evil'
+//! re1_build = "21744136"
 //! ```
 //!
 //! Saved games default to `<config dir>/save` (the `savedat1..8.dat` slot
@@ -104,8 +110,21 @@ pub struct Config {
     pub graphics: Graphics,
     /// The `[mods]` enable/disable/order selection.
     pub mods: Mods,
+    /// The `[games]` launcher bookkeeping.
+    pub games: Games,
     /// The `[game]` gameplay options.
     pub game: Game,
+}
+
+/// The `[games]` launcher bookkeeping: where each game's installation is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Games {
+    /// The last accepted Resident Evil installation, used to rebuild the
+    /// pack without asking for the folder again.
+    pub re1_source: Option<PathBuf>,
+    /// The Steam build id recorded next to that source, when it came from
+    /// Steam.
+    pub re1_build: Option<String>,
 }
 
 /// The `[game]` gameplay options.
@@ -129,6 +148,7 @@ enum Table {
     Bindings,
     Graphics,
     Mods,
+    Games,
     Game,
     /// A table that could not be used; its keys are skipped.
     Ignored,
@@ -173,6 +193,7 @@ impl Config {
         };
         let (mut config, warnings) = Self::parse_lenient(&text);
         config.save_dir = config.save_dir.map(|dir| expand_tilde(&dir));
+        config.games.re1_source = config.games.re1_source.map(|dir| expand_tilde(&dir));
         let warnings = warnings
             .into_iter()
             .map(|warning| format!("{}: {warning}", path.display()))
@@ -214,10 +235,12 @@ impl Config {
         let mut table = Table::Root;
         let mut seen_graphics = false;
         let mut seen_mods = false;
+        let mut seen_games = false;
         let mut seen_game = false;
         let mut bound = Vec::new();
         let mut graphics_keys: Vec<String> = Vec::new();
         let mut mod_keys: Vec<String> = Vec::new();
+        let mut games_keys: Vec<String> = Vec::new();
         let mut game_keys: Vec<String> = Vec::new();
         for (index, raw) in text.lines().enumerate() {
             let line = index + 1;
@@ -239,11 +262,15 @@ impl Config {
                         seen_mods = true;
                         Table::Mods
                     }
+                    Some("games") if !seen_games => {
+                        seen_games = true;
+                        Table::Games
+                    }
                     Some("game") if !seen_game => {
                         seen_game = true;
                         Table::Game
                     }
-                    Some(name @ ("bindings" | "graphics" | "mods" | "game")) => {
+                    Some(name @ ("bindings" | "graphics" | "mods" | "games" | "game")) => {
                         warnings.push(format!("line {line}: duplicate [{name}] table ignored"));
                         Table::Ignored
                     }
@@ -265,6 +292,7 @@ impl Config {
                     parse_graphics_line(&mut config.graphics, &mut graphics_keys, content, line)
                 }
                 Table::Mods => parse_mods_line(&mut config.mods, &mut mod_keys, content, line),
+                Table::Games => parse_games_line(&mut config.games, &mut games_keys, content, line),
                 Table::Game => parse_game_line(&mut config.game, &mut game_keys, content, line),
                 Table::Bindings => parse_binding_line(&mut config, &mut bound, content, line),
             };
@@ -301,6 +329,14 @@ impl Config {
             }
             out.push_str("[mods]\n");
             out.push_str(&mods);
+        }
+        let games = render_games(&self.games);
+        if !games.is_empty() {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str("[games]\n");
+            out.push_str(&games);
         }
         if let Some(bindings) = &self.bindings {
             if !out.is_empty() {
@@ -353,6 +389,15 @@ impl Config {
     pub fn save_bindings(path: &Path, bindings: &Bindings) -> Result<()> {
         Self::update(path, |config| {
             config.bindings = (*bindings != Bindings::default()).then(|| bindings.clone());
+        })
+    }
+
+    /// Persist the launcher's remembered Resident Evil source and Steam build
+    /// id, keeping the file's other keys. A `None` source removes the entry.
+    pub fn save_games(path: &Path, source: Option<&Path>, build: Option<&str>) -> Result<()> {
+        Self::update(path, |config| {
+            config.games.re1_source = source.map(Path::to_path_buf);
+            config.games.re1_build = build.map(str::to_string);
         })
     }
 
@@ -571,6 +616,55 @@ fn render_mods(mods: &Mods) -> String {
             let ids: Vec<String> = ids.iter().map(|id| quote(id)).collect();
             out.push_str(&format!("{key} = [{}]\n", ids.join(", ")));
         }
+    }
+    out
+}
+
+/// Parse one `[games]` line into `games`.
+fn parse_games_line(
+    games: &mut Games,
+    seen: &mut Vec<String>,
+    content: &str,
+    line: usize,
+) -> Result<()> {
+    let (key, value) = key_value(content, line)?;
+    if seen.iter().any(|seen| seen == key) {
+        bail!("line {line}: duplicate key `{key}`");
+    }
+    seen.push(key.to_string());
+    if !value.starts_with(['"', '\'']) {
+        bail!("line {line}: `{key}` expects a quoted string");
+    }
+    let value = parse_quoted(value, line)?;
+    match key {
+        "re1_source" => {
+            if value.is_empty() {
+                bail!("line {line}: re1_source is empty");
+            }
+            games.re1_source = Some(PathBuf::from(value));
+        }
+        "re1_build" => {
+            if value.is_empty() {
+                bail!("line {line}: re1_build is empty");
+            }
+            games.re1_build = Some(value);
+        }
+        other => bail!("line {line}: unknown key `{other}`"),
+    }
+    Ok(())
+}
+
+/// The `[games]` keys that are set.
+fn render_games(games: &Games) -> String {
+    let mut out = String::new();
+    if let Some(source) = &games.re1_source {
+        out.push_str(&format!(
+            "re1_source = {}\n",
+            quote(&source.to_string_lossy())
+        ));
+    }
+    if let Some(build) = &games.re1_build {
+        out.push_str(&format!("re1_build = {}\n", quote(build)));
     }
     out
 }
@@ -869,6 +963,7 @@ mod tests {
             bindings: None,
             graphics: Graphics::default(),
             mods: Mods::default(),
+            games: Games::default(),
             game: Game::default(),
         }
         .render();
@@ -1353,6 +1448,37 @@ mod tests {
         let (config, warnings) = Config::load(&path);
         assert_eq!(config, Config::default());
         assert!(warnings[0].contains("arklay.toml"), "{warnings:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_games_source_roundtrips_and_saves() {
+        let text = "[games]\nre1_source = 'C:\\Games\\RE1'\nre1_build = \"21744136\"\n";
+        let config = Config::parse(text).unwrap();
+        assert_eq!(
+            config.games.re1_source.as_deref(),
+            Some(Path::new(r"C:\Games\RE1"))
+        );
+        assert_eq!(config.games.re1_build.as_deref(), Some("21744136"));
+        assert_eq!(Config::parse(&config.render()).unwrap(), config);
+
+        let dir = std::env::temp_dir().join(format!("arklay-config-{}-games", std::process::id()));
+        let path = dir.join("arklay.toml");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "language = \"en-US\"\n").unwrap();
+        Config::save_games(&path, Some(Path::new(r"D:\Steam\RE1")), Some("42")).unwrap();
+        let (loaded, warnings) = Config::load(&path);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            loaded.games.re1_source.as_deref(),
+            Some(Path::new(r"D:\Steam\RE1"))
+        );
+        assert_eq!(loaded.games.re1_build.as_deref(), Some("42"));
+        assert_eq!(loaded.language.as_deref(), Some("en-US"));
+
+        Config::save_games(&path, None, None).unwrap();
+        assert_eq!(Config::load(&path).0.games, Games::default());
         let _ = fs::remove_dir_all(&dir);
     }
 

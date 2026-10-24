@@ -23,7 +23,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -625,6 +625,104 @@ impl LayerOptions {
     }
 }
 
+/// Read only a pack image's `manifest.toml`, without loading the asset
+/// payload. The launcher lists a directory of packs and needs their id,
+/// name, version and conversion revision; opening a 486 MB image just for
+/// that would be wasteful.
+pub fn read_manifest(path: &Path) -> Result<Option<manifest::Manifest>> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("failed to read pack {}", path.display()))?;
+    let len = file
+        .metadata()
+        .with_context(|| format!("failed to read pack {}", path.display()))?
+        .len();
+    if len < HEADER_LEN as u64 {
+        bail!("pack is smaller than the header");
+    }
+    let mut header = [0u8; HEADER_LEN];
+    file.read_exact(&mut header)
+        .with_context(|| format!("failed to read pack {}", path.display()))?;
+    if header[..4] != MAGIC {
+        bail!("pack magic is not APAK");
+    }
+    let version = u16::from_le_bytes([header[4], header[5]]);
+    if version != VERSION {
+        bail!("unsupported pack version {version}");
+    }
+    let entry_count = u32::from_le_bytes([header[6], header[7], header[8], header[9]]) as usize;
+    budget::check_len(entry_count, budget::MAX_PACK_ENTRIES, "pack entry count")?;
+    let toc_len = entry_count
+        .checked_mul(ENTRY_LEN)
+        .context("pack entry count overflows the address space")?;
+    if (HEADER_LEN + toc_len) as u64 > len {
+        bail!("pack table of contents is truncated");
+    }
+    let mut toc = vec![0u8; toc_len];
+    file.read_exact(&mut toc)
+        .with_context(|| format!("failed to read pack {}", path.display()))?;
+
+    // Paths sit in the payload area, NUL-terminated; a path this long is
+    // already invalid for the container.
+    const MAX_PATH_BYTES: u64 = 4096;
+    let mut found = None;
+    for index in 0..entry_count {
+        let entry = &toc[index * ENTRY_LEN..(index + 1) * ENTRY_LEN];
+        let path_offset = read_u64(entry, 0)?;
+        let data_offset = read_u64(entry, 8)?;
+        let length = budget::check_len_u64(
+            read_u64(entry, 16)?,
+            budget::MAX_ENTRY_BYTES,
+            &format!("entry {index} length"),
+        )?;
+        let length = usize::try_from(length).context("entry length does not fit in memory")?;
+        let compression =
+            Compression::from_mode(entry[24]).map_err(|err| anyhow!("entry {index} has {err}"))?;
+        if path_offset >= len {
+            bail!("entry {index} path offset {path_offset} is out of bounds");
+        }
+        let available = (len - path_offset).min(MAX_PATH_BYTES);
+        let mut text = vec![0u8; available as usize];
+        file.seek(SeekFrom::Start(path_offset))
+            .with_context(|| format!("failed to read pack {}", path.display()))?;
+        file.read_exact(&mut text)
+            .with_context(|| format!("failed to read pack {}", path.display()))?;
+        let Some(nul) = text.iter().position(|&byte| byte == 0) else {
+            bail!("entry {index} path is not NUL-terminated");
+        };
+        let name = std::str::from_utf8(&text[..nul])
+            .with_context(|| format!("entry {index} path is not valid UTF-8"))?;
+        if name.eq_ignore_ascii_case(manifest::ENTRY) {
+            found = Some((data_offset, length, compression));
+            break;
+        }
+    }
+
+    let Some((data_offset, length, compression)) = found else {
+        return Ok(None);
+    };
+    let end = data_offset
+        .checked_add(length as u64)
+        .with_context(|| "manifest.toml data range overflows")?;
+    if end > len {
+        bail!("manifest.toml data range {data_offset}..{end} is out of bounds");
+    }
+    let mut data = vec![0u8; length];
+    file.seek(SeekFrom::Start(data_offset))
+        .with_context(|| format!("failed to read pack {}", path.display()))?;
+    file.read_exact(&mut data)
+        .with_context(|| format!("failed to read pack {}", path.display()))?;
+    let data = match compression {
+        Compression::None => data,
+        Compression::Zstd => {
+            zstd::decode_all(data.as_slice()).context("manifest.toml is not a valid zstd frame")?
+        }
+    };
+    let text = std::str::from_utf8(&data).context("manifest.toml is not valid UTF-8")?;
+    Ok(Some(
+        manifest::Manifest::parse(text).context("invalid manifest.toml")?,
+    ))
+}
+
 /// A parsed `.akpak` pack or directory pack, optionally layered over by mods.
 ///
 /// A plain [`Pack::open`] holds one pack image or indexes one directory;
@@ -934,7 +1032,7 @@ impl Pack {
         Ok(pack)
     }
 
-    /// Parse this pack's own `manifest.toml` entry, when it has one.
+    /// Read this pack's own `manifest.toml` entry, when it has one.
     fn read_manifest(&self) -> Result<Option<manifest::Manifest>> {
         let Some(&index) = self.lookup.get(&manifest::ENTRY.to_ascii_lowercase()) else {
             return Ok(None);
@@ -2150,6 +2248,7 @@ mod tests {
             scd_version: manifest::DEFAULT_SCD_VERSION.to_string(),
             language: None,
             engine: None,
+            convert_version: None,
             lua: Vec::new(),
         }
         .render()
@@ -2609,5 +2708,47 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("invalid manifest.toml"), "{err}");
+    }
+
+    #[test]
+    fn read_manifest_skips_the_payload_and_handles_zstd() {
+        let dir = std::env::temp_dir().join(format!("arklay-manifest-read-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("re1.akpak");
+        let manifest = manifest::Manifest {
+            convert_version: Some(7),
+            ..manifest::Manifest::base("re1")
+        };
+        let mut writer = PackWriter::new();
+        writer
+            .add(manifest::ENTRY, manifest.render().into_bytes())
+            .unwrap();
+        writer.add("room/1000.rdt", vec![0x5a; 64 * 1024]).unwrap();
+        writer.compress_entries(2, |_| false).unwrap();
+        writer.write(&path).unwrap();
+
+        assert_eq!(read_manifest(&path).unwrap(), Some(manifest.clone()));
+
+        let mut plain = PackWriter::new();
+        plain
+            .add(manifest::ENTRY, manifest.render().into_bytes())
+            .unwrap();
+        plain.write(&dir.join("plain.akpak")).unwrap();
+        assert_eq!(
+            read_manifest(&dir.join("plain.akpak")).unwrap(),
+            Some(manifest)
+        );
+
+        let mut empty = PackWriter::new();
+        empty.add("a.txt", b"x".to_vec()).unwrap();
+        empty.write(&dir.join("empty.akpak")).unwrap();
+        assert!(read_manifest(&dir.join("empty.akpak")).unwrap().is_none());
+
+        let err = read_manifest(&dir.join("missing.akpak"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("failed to read pack"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

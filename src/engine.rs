@@ -1391,6 +1391,11 @@ impl Display {
         }
     }
 
+    /// The raw SDL window, for the folder picker.
+    pub(crate) fn window_ptr(&self) -> *mut SDL_Window {
+        self.window
+    }
+
     /// The window's client size in window coordinates (before the display
     /// scale), which is what SDL's mouse events use.
     pub(crate) fn window_size(&self) -> (u32, u32) {

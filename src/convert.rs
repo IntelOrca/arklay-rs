@@ -16,8 +16,8 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -28,7 +28,7 @@ use crate::model::Texture8;
 use crate::movie;
 use crate::music;
 use crate::pack::PackWriter;
-use crate::progress::{Progress, format_duration};
+use crate::progress::{Progress, ProgressObserver, format_duration};
 use crate::sfx;
 use crate::state::{Image, RoomId};
 use crate::voice;
@@ -106,6 +106,9 @@ fn parallel_map<T: Send>(
     if threads == 1 {
         let mut out = Vec::with_capacity(count);
         for index in 0..count {
+            if progress.is_cancelled() {
+                bail!("conversion cancelled");
+            }
             let (label, units, value) = job(index)?;
             progress.advance_named(units, &label);
             out.push((label, value));
@@ -122,6 +125,14 @@ fn parallel_map<T: Send>(
             scope.spawn(|| {
                 loop {
                     if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    if progress
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .is_cancelled()
+                    {
+                        stop.store(true, Ordering::Relaxed);
                         return;
                     }
                     let index = next.fetch_add(1, Ordering::Relaxed);
@@ -147,6 +158,13 @@ fn parallel_map<T: Send>(
         }
     });
 
+    if progress
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_cancelled()
+    {
+        bail!("conversion cancelled");
+    }
     let mut collected = results
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -167,6 +185,12 @@ struct ProgressWriter<'a, W> {
 
 impl<W: Write> Write for ProgressWriter<'_, W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.progress.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "conversion cancelled",
+            ));
+        }
         let written = self.inner.write(buf)?;
         self.progress.advance_by(written as u64);
         Ok(written)
@@ -267,6 +291,13 @@ pub fn convert_game(root: &Path, out: &Path) -> Result<()> {
     convert_game_with_options(root, out, 0, false)
 }
 
+/// Check that `root` looks like a supported Resident Evil installation,
+/// without converting anything. The launcher uses this before starting a
+/// multi-hundred-megabyte conversion, so a wrong folder fails immediately.
+pub fn validate_install(root: &Path) -> Result<()> {
+    discover_layout(root).map(|_| ())
+}
+
 /// Like [`convert_game`], but with an explicit worker count and whether the
 /// verbose per-file report is printed.
 ///
@@ -292,10 +323,34 @@ pub fn convert_game_with_options(
     jobs: usize,
     verbose: bool,
 ) -> Result<()> {
+    convert_game_observed(root, out, jobs, verbose, None, None)
+}
+
+/// Convert with a graphical progress observer and an optional cancellation
+/// flag. The launcher uses this to keep its window responsive while a pack is
+/// built; the flag is checked between files, at phase boundaries and during
+/// the final write, and an aborted run leaves no partial pack behind.
+pub fn convert_game_observed(
+    root: &Path,
+    out: &Path,
+    jobs: usize,
+    verbose: bool,
+    observer: Option<ProgressObserver>,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<()> {
     let jobs = worker_count(jobs);
     // The phase count is only known once the plan is built; `build_plan` fills
     // it in before reporting the scan, the first phase.
-    let mut progress = Progress::new("convert-game", 0);
+    let mut progress = match observer {
+        Some(observer) => Progress::observed("convert-game", 0, observer, cancel),
+        None => {
+            let mut progress = Progress::new("convert-game", 0);
+            if let Some(cancel) = cancel {
+                progress.set_cancel(cancel);
+            }
+            progress
+        }
+    };
     let Plan {
         rooms,
         sound,
@@ -317,6 +372,9 @@ pub fn convert_game_with_options(
         movie_dir_found,
         mut warnings,
     } = build_plan_with_progress(root, jobs, &mut progress)?;
+    if progress.is_cancelled() {
+        bail!("conversion cancelled");
+    }
     if !voice_dir_found {
         warnings.push(format!(
             "no voice directory found; {} voice line(s) will be missing",
@@ -1838,12 +1896,21 @@ fn copy_map_art(
 
 /// The id of the pack `convert-game` writes.
 pub const BASE_PACK_ID: &str = "re1";
+
+/// Revision of the converted pack's contents and layout.
+///
+/// Bump this whenever a change to the converter would make the same source
+/// installation produce a different pack: asset conversion rules, the packed
+/// scripts and language files, the manifest, or the compression policy. The
+/// launcher compares it with the pack's manifest and asks for a rebuild when
+/// they differ.
+pub const CONVERT_VERSION: u32 = 1;
 /// The base pack's self-description.
 fn base_manifest(language: &str) -> manifest::Manifest {
     manifest::Manifest {
         format: manifest::FORMAT,
         id: BASE_PACK_ID.to_string(),
-        name: Some(env!("CARGO_PKG_NAME").to_string()),
+        name: Some("Resident Evil".to_string()),
         version: Some(env!("CARGO_PKG_VERSION").to_string()),
         kind: manifest::PackKind::Base,
         base: None,
@@ -1854,6 +1921,7 @@ fn base_manifest(language: &str) -> manifest::Manifest {
         // Japanese releases, the Steam tree's language for the Western ones).
         language: Some(language.to_string()),
         engine: None,
+        convert_version: Some(CONVERT_VERSION),
         lua: Vec::new(),
     }
 }
@@ -3279,6 +3347,53 @@ mod tests {
         }
         assert!(!message.contains("Char10"), "{message}");
         assert!(!message.contains("W00"), "{message}");
+    }
+
+    #[test]
+    fn an_observer_receives_conversion_progress_and_cancel_stops_the_run() {
+        let root = TempDir::new("observed-convert");
+        make_stage_dirs(&root.path);
+        let out = root.path.join("out.akpak");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        convert_game_observed(
+            &root.path,
+            &out,
+            1,
+            false,
+            Some(Box::new(move |snapshot| {
+                sink.lock().unwrap().push(snapshot);
+            })),
+            None,
+        )
+        .unwrap();
+        let seen = seen.lock().unwrap();
+        assert!(seen.len() > 2, "{} snapshots", seen.len());
+        assert!(seen.iter().any(|snapshot| snapshot.label == "write"));
+        assert!(seen.last().unwrap().overall >= 0.99);
+        assert_eq!(
+            crate::pack::read_manifest(&out)
+                .unwrap()
+                .unwrap()
+                .convert_version,
+            Some(CONVERT_VERSION)
+        );
+
+        let cancelled = root.path.join("cancelled.akpak");
+        let cancel = Arc::new(AtomicBool::new(true));
+        let result = convert_game_observed(
+            &root.path,
+            &cancelled,
+            1,
+            false,
+            None,
+            Some(Arc::clone(&cancel)),
+        );
+        assert!(result.is_err());
+        assert!(
+            !cancelled.exists(),
+            "an aborted conversion leaves no pack behind"
+        );
     }
 
     #[test]
