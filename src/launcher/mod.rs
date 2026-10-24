@@ -96,8 +96,8 @@ impl Frame {
     }
 
     fn clear(&mut self) {
-        for pixel in self.rgba.chunks_exact_mut(4) {
-            pixel.copy_from_slice(&[0, 0, 0, 255]);
+        for pixel in self.rgba.as_chunks_mut::<4>().0 {
+            *pixel = [0, 0, 0, 255];
         }
     }
 }
@@ -1071,24 +1071,18 @@ impl Launcher {
                     self.move_mod(1);
                 }
             }
-            SDL_SCANCODE_B => {
-                if self.screen == Screen::Install {
-                    self.browse(display);
-                }
-            }
-            SDL_SCANCODE_O => {
-                if self.screen == Screen::Mods {
-                    let dir = match self.mods.get(self.mods_index) {
-                        Some(row) if row.path.is_dir() => row.path.clone(),
-                        Some(row) => row
-                            .path
-                            .parent()
-                            .map(Path::to_path_buf)
-                            .unwrap_or_else(|| row.path.clone()),
-                        None => paths::mods_dir(&paths::primary_data_dir()),
-                    };
-                    open_folder(&dir);
-                }
+            SDL_SCANCODE_B if self.screen == Screen::Install => self.browse(display),
+            SDL_SCANCODE_O if self.screen == Screen::Mods => {
+                let dir = match self.mods.get(self.mods_index) {
+                    Some(row) if row.path.is_dir() => row.path.clone(),
+                    Some(row) => row
+                        .path
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| row.path.clone()),
+                    None => paths::mods_dir(&paths::primary_data_dir()),
+                };
+                open_folder(&dir);
             }
             _ => {}
         }

@@ -203,7 +203,12 @@ mod tests {
             "A",
             Color::BODY,
         );
-        assert!(rgba.chunks_exact(4).any(|pixel| pixel[..3] != [0, 0, 0]));
+        assert!(
+            rgba.as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[..3] != [0, 0, 0])
+        );
     }
 
     #[test]
