@@ -5535,11 +5535,15 @@ impl GameSession {
         }
         // The loading narration and the films present the centred band; the
         // room and its overlays the band following the player. The F1 debug
-        // menu and a screen on black without a canvas (a mod's screen that
-        // predates `canvas`) are laid out for 240 rows, so while one is up
-        // the whole 4:3 frame is presented, pillarboxed, instead.
+        // menu, a door transition (drawn on black) and a screen on black
+        // without a canvas (a mod's screen that predates `canvas`) are laid
+        // out for 240 rows, so while one is up the whole 4:3 frame is
+        // presented, pillarboxed, instead of cropped.
         if canvas.is_none() {
-            self.framebuffer.view = if self.debug_menu.is_some() || self.screen_on_black(|_| true) {
+            self.framebuffer.view = if self.debug_menu.is_some()
+                || self.transition.is_some()
+                || self.screen_on_black(|_| true)
+            {
                 video::View::default()
             } else if self.boot_message.is_some() || self.movie.is_some() {
                 video::aspect().centred()
@@ -23522,6 +23526,36 @@ off_0010:
         let frame = session.frame();
         assert_eq!((frame.width, frame.height), (320, 240));
         assert_eq!(frame.view, video::View::default());
+        video::set_aspect(video::Aspect::default());
+    }
+
+    /// At a wider aspect a door transition, drawn on black, presents the
+    /// whole 4:3 frame (pillarboxed) instead of cropping the door, and the
+    /// destination room returns to the band once it is over.
+    #[test]
+    fn a_wide_door_transition_presents_the_whole_frame() {
+        let dir = TempDir::new();
+        let (pack, a, _) = two_room_door_pack(&dir);
+        video::set_aspect(video::Aspect::parse("16:9").unwrap());
+        let mut session = GameSession::from_room(&pack, a, Path::new("saves")).unwrap();
+        trigger_test_door(&pack, &mut session);
+        assert!(session.transition.is_some());
+        session.render(&pack);
+        assert_eq!(session.frame().view, video::View::default());
+
+        for _ in 0..MAX_TRANSITION_FRAMES {
+            session.tick_transition(&pack, TransitionSkip::Pad(false));
+            if session.transition_finished {
+                break;
+            }
+        }
+        session.render(&pack);
+        session.finish_transition(&pack);
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        session.render(&pack);
+        assert_eq!(session.frame().view.height, 180);
         video::set_aspect(video::Aspect::default());
     }
 

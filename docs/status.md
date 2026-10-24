@@ -616,11 +616,11 @@ the player moved to while the panel was hidden. `--ui debug` captures the list.
   ratio (`4:3`, `16:9`, `16:10`), saved to `[graphics]`.
 
 `[graphics] aspect` (also `--aspect`) presents a wider frame by cropping the
-320x240 view: in a room the band follows the player's chest row, films show the
-centred band, and the F1 panel stays a pillarboxed 4:3 frame. The message
-window and overlays draw in the band, while the pause menu and its sub-screens
-take a full-height canvas of the aspect's width. Captures, traces, the oracle
-and the goldens always run 4:3.
+320x240 view: in a room the band follows the player's chest row, films show
+the centred band, and the F1 panel and door transitions stay a pillarboxed 4:3
+frame. The message window and overlays draw in the band, while the pause menu
+and its sub-screens take a full-height canvas of the aspect's width. Captures,
+traces, the oracle and the goldens always run 4:3.
 
 The in-game F9 return-to-title prompt follows the original: the first F9
 freezes the room, dims the frame and pauses the game sounds; a second F9

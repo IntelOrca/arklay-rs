@@ -396,10 +396,11 @@ more responsive.
 `aspect` (also `--aspect` and the F1 DISPLAY tool) presents a wider frame by
 cropping the 320x240 view rather than pillarboxing it. In a room the visible
 band follows the player's chest row with a small dead zone; films show the
-centred band, while the F1 debug menu keeps the whole 4:3 frame, pillarboxed.
-The 2D screens lay out in the band, and the pause menu and its sub-screens
-take a full-height 16:9 or 16:10 canvas. Captures, traces, the oracle and the
-goldens always run 4:3, so a wider aspect changes presentation only.
+centred band, while the F1 debug menu and door transitions keep the whole 4:3
+frame, pillarboxed, so the door is not cropped. The 2D screens lay out in the
+band, and the pause menu and its sub-screens take a full-height 16:9 or 16:10
+canvas. Captures, traces, the oracle and the goldens always run 4:3, so a
+wider aspect changes presentation only.
 
 The GPU renderer draws its 3D scene at the size the frame fills on screen, so
 `render_scale` above 100 supersamples and below 100 trades sharpness for

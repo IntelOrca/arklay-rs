@@ -211,8 +211,9 @@ pub fn set_aspect(aspect: Aspect) {
 
 /// The band a frame whose own view is `view` presents at this thread's
 /// aspect: `view` when it has the aspect's height or is the whole frame
-/// (presented pillarboxed: the F1 debug menu), else the centred band (a
-/// band of another aspect's height, from before a change).
+/// (presented pillarboxed: the F1 debug menu or a door transition), else
+/// the centred band (a band of another aspect's height, from before a
+/// change).
 pub fn presented(view: View) -> View {
     let aspect = aspect();
     if view.height == aspect.height() || view.is_full() {

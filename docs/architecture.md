@@ -419,10 +419,10 @@ presenting does the same mid-game.
   (`Framebuffer::with_screen`), keeping their distance from its bottom. Lua
   screens lay out in the band, or ask for a full-height canvas of the aspect's
   width (427x240 at 16:9) that replaces the frame while they are up (the pause
-  menu and its sub-screens). The F1 debug menu presents the whole 4:3 frame,
-  pillarboxed. Both backends accept the canvas. The GPU path resizes its
-  overlay layers to match, while the scene targets keep covering the 4:3
-  frame.
+  menu and its sub-screens). The F1 debug menu and a door transition (drawn
+  on black) present the whole 4:3 frame, pillarboxed. Both backends accept
+  the canvas. The GPU path resizes its overlay layers to match, while the
+  scene targets keep covering the 4:3 frame.
 
   A 320x240 layer reaches the viewport with nearest sampling at a whole
   zoom (always, windowed) and with sharp (pixel-art) sampling at a fractional
